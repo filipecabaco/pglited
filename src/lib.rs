@@ -798,8 +798,14 @@ impl AsyncPgliteExecutor {
                         match result {
                             Some(request) => {
                                 let _permit = WASM_SEMAPHORE.acquire().await;
+                                let runtime_clone = Arc::clone(&runtime);
+                                let query = request.query;
 
-                                match runtime.process_wire_message(&request.query) {
+                                let response = tokio::task::spawn_blocking(move || {
+                                    runtime_clone.process_wire_message(&query)
+                                }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("Task panicked")));
+
+                                match response {
                                     Ok(response) => {
                                         let _ = request.response_tx.send(response);
                                     }
@@ -819,8 +825,14 @@ impl AsyncPgliteExecutor {
                         match result {
                             Some(request) => {
                                 let _permit = WASM_SEMAPHORE.acquire().await;
+                                let runtime_clone = Arc::clone(&runtime);
+                                let query = request.query;
 
-                                match runtime.process_wire_message(&request.query) {
+                                let response = tokio::task::spawn_blocking(move || {
+                                    runtime_clone.process_wire_message(&query)
+                                }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("Task panicked")));
+
+                                match response {
                                     Ok(response) => {
                                         let _ = request.response_tx.send(response);
                                     }
