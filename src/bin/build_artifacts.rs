@@ -21,7 +21,7 @@
 //!   - <output_dir>/pgdata_seed.tar.zst - Pre-initialized PGDATA
 
 use anyhow::{Context, Result};
-use pglite_port::{PgliteConfig, PgliteRuntime};
+use pglited::{PgliteConfig, PgliteRuntime};
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};

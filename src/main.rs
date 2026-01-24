@@ -1,6 +1,6 @@
 //! PGlite Port - Wasmtime-based PostgreSQL runtime
 //!
-//! Usage: pglite_port <data_dir> <tcp_port> <wasm_path> <prefix_dir> [pgdata_seed_path]
+//! Usage: pglited <data_dir> <tcp_port> <wasm_path> <prefix_dir> [pgdata_seed_path]
 //!
 //! Arguments:
 //!   data_dir         - Directory for PostgreSQL data (will be created if missing)
@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
-use pglite_port::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
+use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
 use serde_json::json;
 use std::env;
 use std::path::PathBuf;
@@ -302,7 +302,7 @@ async fn main() -> Result<()> {
                         let executor_clone = Arc::clone(&executor);
 
                         tokio::spawn(async move {
-                            if let Err(e) = pglite_port::handle_connection_async(stream, executor_clone).await {
+                            if let Err(e) = pglited::handle_connection_async(stream, executor_clone).await {
                                 debug_log!("Connection error from {:?}: {:?}", addr, e);
                             } else {
                                 debug_log!("Client {:?} disconnected", addr);

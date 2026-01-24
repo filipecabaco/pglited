@@ -17,11 +17,11 @@ impl TestInstance {
         let target_dir = exe_dir.parent().unwrap().parent().unwrap();
 
         let possible_paths = vec![
-            target_dir.join("pglite_port"),
-            target_dir.join("debug").join("pglite_port"),
-            target_dir.join("release").join("pglite_port"),
-            target_dir.parent().unwrap().join("debug").join("pglite_port"),
-            target_dir.parent().unwrap().join("release").join("pglite_port"),
+            target_dir.join("pglited"),
+            target_dir.join("debug").join("pglited"),
+            target_dir.join("release").join("pglited"),
+            target_dir.parent().unwrap().join("debug").join("pglited"),
+            target_dir.parent().unwrap().join("release").join("pglited"),
         ];
 
         let binary_path = possible_paths
