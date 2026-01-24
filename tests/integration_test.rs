@@ -1,6 +1,5 @@
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -10,13 +9,13 @@ struct TestInstance {
 }
 
 impl TestInstance {
-    fn start(data_dir: &str, tcp_port: u16, wasm_path: &str, prefix_dir: &str) -> Result<Self, String> {
-        let exe_dir = std::env::current_exe()
-            .map_err(|e| format!("Failed to get current exe: {}", e))?;
+    fn start(data_dir: &str, tcp_port: u16) -> Result<Self, String> {
+        let exe_dir =
+            std::env::current_exe().map_err(|e| format!("Failed to get current exe: {}", e))?;
 
         let target_dir = exe_dir.parent().unwrap().parent().unwrap();
 
-        let possible_paths = vec![
+        let possible_paths = [
             target_dir.join("pglited"),
             target_dir.join("debug").join("pglited"),
             target_dir.join("release").join("pglited"),
@@ -39,8 +38,11 @@ impl TestInstance {
             })?
             .clone();
 
+        eprintln!("Starting binary: {:?}", binary_path);
+        eprintln!("Args: {} {}", data_dir, tcp_port);
+
         let process = Command::new(&binary_path)
-            .args(&[data_dir, &tcp_port.to_string(), wasm_path, prefix_dir])
+            .args([data_dir, &tcp_port.to_string()])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -50,11 +52,7 @@ impl TestInstance {
     }
 
     fn wait_for_ready(&mut self, timeout_secs: u64) -> Result<(), String> {
-        let stdout = self
-            .process
-            .stdout
-            .take()
-            .ok_or("Failed to get stdout")?;
+        let stdout = self.process.stdout.take().ok_or("Failed to get stdout")?;
 
         let reader = BufReader::new(stdout);
         let start = std::time::Instant::now();
@@ -88,65 +86,31 @@ impl TestInstance {
 impl Drop for TestInstance {
     fn drop(&mut self) {
         let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
-}
 
-fn find_wasm_path() -> PathBuf {
-    let possible_paths = vec![
-        PathBuf::from("../priv/pglite.wasi"),
-        PathBuf::from("priv/pglite.wasi"),
-        PathBuf::from("../../priv/pglite.wasi"),
-    ];
+        if let Some(mut stderr) = self.process.stderr.take() {
+            use std::io::Read;
+            let mut stderr_output = String::new();
+            let _ = stderr.read_to_string(&mut stderr_output);
+            if !stderr_output.is_empty() {
+                eprintln!("Binary stderr:\n{}", stderr_output);
+            }
+        }
 
-    for path in &possible_paths {
-        if path.exists() {
-            return path.canonicalize().unwrap_or_else(|_| path.clone());
+        let status = self.process.wait();
+        if let Ok(s) = status {
+            if !s.success() {
+                eprintln!("Process exited with status: {:?}", s);
+            }
         }
     }
-
-    panic!(
-        "pglite.wasi not found. Searched:\n{}",
-        possible_paths
-            .iter()
-            .map(|p| format!("  {:?}", p))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-}
-
-fn find_prefix_dir() -> PathBuf {
-    let possible_paths = vec![
-        PathBuf::from("../priv/pglite_prefix"),
-        PathBuf::from("priv/pglite_prefix"),
-        PathBuf::from("../../priv/pglite_prefix"),
-    ];
-
-    for path in &possible_paths {
-        if path.exists() {
-            return path.canonicalize().unwrap_or_else(|_| path.clone());
-        }
-    }
-
-    panic!(
-        "pglite_prefix not found. Searched:\n{}",
-        possible_paths
-            .iter()
-            .map(|p| format!("  {:?}", p))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
 }
 
 #[test]
 fn test_binary_starts_and_binds_port() {
-    let wasm_path = find_wasm_path();
-    let prefix_dir = find_prefix_dir();
     let data_dir = format!("memory://test_{}", std::process::id());
     let tcp_port = 55000 + (std::process::id() % 1000) as u16;
 
-    let mut instance = TestInstance::start(&data_dir, tcp_port, wasm_path.to_str().unwrap(), prefix_dir.to_str().unwrap())
-        .expect("Failed to start instance");
+    let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
     match instance.wait_for_ready(60) {
         Ok(()) => {
@@ -169,8 +133,6 @@ fn test_binary_starts_and_binds_port() {
 
 #[test]
 fn test_multiple_instances_different_ports() {
-    let wasm_path = find_wasm_path();
-    let prefix_dir = find_prefix_dir();
     let base_port = 55100 + (std::process::id() % 100) as u16;
 
     let mut instances: Vec<TestInstance> = Vec::new();
@@ -179,7 +141,7 @@ fn test_multiple_instances_different_ports() {
         let data_dir = format!("memory://test_multi_{}_{}", std::process::id(), i);
         let tcp_port = base_port + i;
 
-        match TestInstance::start(&data_dir, tcp_port, wasm_path.to_str().unwrap(), prefix_dir.to_str().unwrap()) {
+        match TestInstance::start(&data_dir, tcp_port) {
             Ok(instance) => {
                 instances.push(instance);
             }
@@ -208,16 +170,13 @@ fn test_multiple_instances_different_ports() {
 
 #[test]
 fn test_persistent_storage_mode() {
-    let wasm_path = find_wasm_path();
-    let prefix_dir = find_prefix_dir();
     let temp_dir = std::env::temp_dir().join(format!("pglite_test_{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
     let data_dir = temp_dir.to_str().unwrap();
     let tcp_port = 55200 + (std::process::id() % 100) as u16;
 
-    let mut instance = TestInstance::start(data_dir, tcp_port, wasm_path.to_str().unwrap(), prefix_dir.to_str().unwrap())
-        .expect("Failed to start instance");
+    let mut instance = TestInstance::start(data_dir, tcp_port).expect("Failed to start instance");
 
     match instance.wait_for_ready(60) {
         Ok(()) => {
@@ -235,13 +194,10 @@ fn test_persistent_storage_mode() {
 
 #[test]
 fn test_ready_signal_format() {
-    let wasm_path = find_wasm_path();
-    let prefix_dir = find_prefix_dir();
     let data_dir = format!("memory://test_signal_{}", std::process::id());
     let tcp_port = 55300 + (std::process::id() % 100) as u16;
 
-    let mut instance = TestInstance::start(&data_dir, tcp_port, wasm_path.to_str().unwrap(), prefix_dir.to_str().unwrap())
-        .expect("Failed to start instance");
+    let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
     let stdout = instance.process.stdout.take().unwrap();
     let reader = BufReader::new(stdout);

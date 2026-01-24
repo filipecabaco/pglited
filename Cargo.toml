@@ -30,6 +30,15 @@ tokio = { version = "1.40", features = ["full", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 
+[build-dependencies]
+ureq = "2.9"
+tar = "0.4"
+xz2 = "0.1"
+zstd = "0.13"
+wasmtime = "40"
+wasmtime-wasi = "40"
+anyhow = "1.0"
+
 [profile.release]
 opt-level = "z"
 lto = true

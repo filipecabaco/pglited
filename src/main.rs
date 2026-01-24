@@ -143,7 +143,9 @@ impl ParsedArgs {
         eprintln!("Arguments:");
         eprintln!("  data_dir         - Directory for PostgreSQL data");
         eprintln!("  tcp_port         - TCP port for PostgreSQL connections");
-        eprintln!("  wasm_path        - Optional: Path to pglite.wasi binary (embedded if omitted)");
+        eprintln!(
+            "  wasm_path        - Optional: Path to pglite.wasi binary (embedded if omitted)"
+        );
         eprintln!("  prefix_dir       - Optional: Directory containing pglite prefix files (embedded if omitted)");
         eprintln!("  pgdata_seed_path - Optional: Pre-initialized PGDATA tarball (faster startup)");
         eprintln!();
@@ -155,7 +157,10 @@ impl ParsedArgs {
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} memory:// 5432", program_name);
-        eprintln!("  {} /tmp/db 5432 /path/to/pglite.wasi /path/to/prefix", program_name);
+        eprintln!(
+            "  {} /tmp/db 5432 /path/to/pglite.wasi /path/to/prefix",
+            program_name
+        );
     }
 
     fn into_config(self) -> PgliteConfig {
@@ -240,7 +245,8 @@ async fn main() -> Result<()> {
         debug_log!("✓ PostgreSQL initialized");
 
         Ok(runtime)
-    }).await;
+    })
+    .await;
 
     let runtime = match runtime {
         Ok(Ok(r)) => r,

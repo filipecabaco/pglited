@@ -1,0 +1,550 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-ubuntu:
+    name: Build (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-stable-
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-stable-
+            ${{ runner.os }}-cargo-index-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-release-
+
+      - name: Cache downloaded assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/pglite.wasi
+            assets/prefix.tar.zst
+          key: pglite-wasi-assets-v1
+
+      - name: Build release binary
+        run: cargo build --release
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+      - name: Verify release binary
+        run: |
+          if [ ! -f target/release/pglited ]; then
+            echo "ERROR: Release binary not found"
+            exit 1
+          fi
+          echo "✓ Release binary built successfully"
+          ls -lh target/release/pglited
+          echo "✓ All assets auto-generated during build:"
+          ls -lh assets/
+
+      - name: Upload release binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pglited-ubuntu
+          path: target/release/pglited
+          retention-days: 1
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-stable-
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-stable-
+            ${{ runner.os }}-cargo-index-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-release-
+
+      - name: Cache downloaded assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/pglite.wasi
+            assets/prefix.tar.zst
+          key: pglite-wasi-assets-v1
+
+      - name: Build release binary
+        run: cargo build --release
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+      - name: Verify release binary
+        run: |
+          if [ ! -f target/release/pglited ]; then
+            echo "ERROR: Release binary not found"
+            exit 1
+          fi
+          echo "✓ Release binary built successfully"
+          ls -lh target/release/pglited
+          echo "✓ All assets auto-generated during build:"
+          ls -lh assets/
+
+      - name: Upload release binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pglited-macos
+          path: target/release/pglited
+          retention-days: 1
+
+  test-ubuntu:
+    name: Test (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build-ubuntu
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-stable-
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-stable-
+            ${{ runner.os }}-cargo-index-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-cargo-build-target-
+      
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pglited-ubuntu
+          path: target/release/
+
+      - name: Cache downloaded assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/pglite.wasi
+            assets/prefix.tar.zst
+          key: pglite-wasi-assets-v1
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run integration tests
+        run: cargo test --test integration_test
+        timeout-minutes: 5
+        env:
+          RUST_TEST_TIMEOUT: 60
+
+      - name: Test binary startup with memory mode (regression test for pgdata_seed)
+        run: |
+          echo "======================================================================"
+          echo "Testing binary startup with memory mode..."
+          echo "This test verifies that pgdata_seed.tar.zst was generated correctly"
+          echo "With proper seed, startup should be < 10 seconds (~100ms expected)"
+          echo "======================================================================"
+          echo ""
+
+          # Start the binary in memory mode
+          timeout 10s ./target/release/pglited memory:// 5432 > /tmp/pglited_startup.log 2>&1 &
+          PID=$!
+
+          echo "Started pglited with PID: $PID"
+
+          # Wait for the ready signal or timeout
+          START_TIME=$(date +%s)
+          READY_SIGNAL=""
+
+          while [ $(($(date +%s) - START_TIME)) -lt 10 ]; do
+            if grep -q '"id":"ready"' /tmp/pglited_startup.log 2>/dev/null; then
+              READY_SIGNAL=$(grep '"id":"ready"' /tmp/pglited_startup.log 2>/dev/null | head -1)
+              break
+            fi
+            sleep 0.1
+          done
+
+          # Kill the process
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+
+          # Check if we got the ready signal
+          if [ -z "$READY_SIGNAL" ]; then
+            echo "❌ FAILED: Ready signal not received within 10 seconds"
+            echo ""
+            echo "This indicates pgdata_seed.tar.zst may be corrupted."
+            echo "Without the seed, PostgreSQL needs to run initdb which takes much longer."
+            echo ""
+            echo "Last 50 lines of output:"
+            tail -50 /tmp/pglited_startup.log || true
+            exit 1
+          fi
+
+          # Verify the ready signal format
+          if ! echo "$READY_SIGNAL" | grep -q '"success":true'; then
+            echo "❌ FAILED: Ready signal indicates failure"
+            echo "Signal: $READY_SIGNAL"
+            exit 1
+          fi
+
+          # Verify the port is correct
+          if ! echo "$READY_SIGNAL" | grep -q '"port":5432'; then
+            echo "❌ FAILED: Ready signal port mismatch"
+            echo "Signal: $READY_SIGNAL"
+            exit 1
+          fi
+
+          STARTUP_TIME=$(($(date +%s) - START_TIME))
+          echo ""
+          echo "✅ SUCCESS: Binary startup completed"
+          echo "✅ Ready signal received: $READY_SIGNAL"
+          echo "✅ Startup time: ${STARTUP_TIME}s (< 10s threshold)"
+          echo ""
+          echo "✅ pgdata_seed generated correctly - fast boot working"
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-ubuntu-latest
+          path: |
+            /tmp/pglited_startup.log
+            /tmp/pglite_*.log
+          retention-days: 7
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    needs: build-macos
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-stable-
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-stable-
+            ${{ runner.os }}-cargo-index-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-cargo-build-target-
+      
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pglited-macos
+          path: target/release/
+
+      - name: Cache downloaded assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/pglite.wasi
+            assets/prefix.tar.zst
+          key: pglite-wasi-assets-v1
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run integration tests
+        run: cargo test --test integration_test
+        timeout-minutes: 5
+        env:
+          RUST_TEST_TIMEOUT: 60
+
+      - name: Test binary startup with memory mode (regression test for pgdata_seed)
+        run: |
+          echo "======================================================================"
+          echo "Testing binary startup with memory mode..."
+          echo "This test verifies that pgdata_seed.tar.zst was generated correctly"
+          echo "With proper seed, startup should be < 10 seconds (~100ms expected)"
+          echo "======================================================================"
+          echo ""
+
+          # Start the binary in memory mode
+          timeout 10s ./target/release/pglited memory:// 5432 > /tmp/pglited_startup.log 2>&1 &
+          PID=$!
+
+          echo "Started pglited with PID: $PID"
+
+          # Wait for the ready signal or timeout
+          START_TIME=$(date +%s)
+          READY_SIGNAL=""
+
+          while [ $(($(date +%s) - START_TIME)) -lt 10 ]; do
+            if grep -q '"id":"ready"' /tmp/pglited_startup.log 2>/dev/null; then
+              READY_SIGNAL=$(grep '"id":"ready"' /tmp/pglited_startup.log 2>/dev/null | head -1)
+              break
+            fi
+            sleep 0.1
+          done
+
+          # Kill the process
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+
+          # Check if we got the ready signal
+          if [ -z "$READY_SIGNAL" ]; then
+            echo "❌ FAILED: Ready signal not received within 10 seconds"
+            echo ""
+            echo "This indicates pgdata_seed.tar.zst may be corrupted."
+            echo "Without the seed, PostgreSQL needs to run initdb which takes much longer."
+            echo ""
+            echo "Last 50 lines of output:"
+            tail -50 /tmp/pglited_startup.log || true
+            exit 1
+          fi
+
+          # Verify the ready signal format
+          if ! echo "$READY_SIGNAL" | grep -q '"success":true'; then
+            echo "❌ FAILED: Ready signal indicates failure"
+            echo "Signal: $READY_SIGNAL"
+            exit 1
+          fi
+
+          # Verify the port is correct
+          if ! echo "$READY_SIGNAL" | grep -q '"port":5432'; then
+            echo "❌ FAILED: Ready signal port mismatch"
+            echo "Signal: $READY_SIGNAL"
+            exit 1
+          fi
+
+          STARTUP_TIME=$(($(date +%s) - START_TIME))
+          echo ""
+          echo "✅ SUCCESS: Binary startup completed"
+          echo "✅ Ready signal received: $READY_SIGNAL"
+          echo "✅ Startup time: ${STARTUP_TIME}s (< 10s threshold)"
+          echo ""
+          echo "✅ pgdata_seed generated correctly - fast boot working"
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-macos-latest
+          path: |
+            /tmp/pglited_startup.log
+            /tmp/pglite_*.log
+          retention-days: 7
+
+  lint-ubuntu:
+    name: Lint (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          cache: true
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-stable-
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-stable-
+            ${{ runner.os }}-cargo-index-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-cargo-build-target-
+      
+      - name: Run rustfmt
+        run: |
+          echo "Checking code formatting..."
+          cargo fmt --all -- --check
+      
+      - name: Run clippy
+        run: |
+          echo "Running clippy lints..."
+          cargo clippy --all-targets --all-features -- -D warnings
+      
+      - name: Build to catch additional warnings
+        run: cargo build --all-targets --all-features
+
+  lint-macos:
+    name: Lint (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          cache: true
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-stable-
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-stable-
+            ${{ runner.os }}-cargo-index-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-cargo-build-target-
+      
+      - name: Run rustfmt
+        run: |
+          echo "Checking code formatting..."
+          cargo fmt --all -- --check
+      
+      - name: Run clippy
+        run: |
+          echo "Running clippy lints..."
+          cargo clippy --all-targets --all-features -- -D warnings
+      
+      - name: Build to catch additional warnings
+        run: cargo build --all-targets --all-features

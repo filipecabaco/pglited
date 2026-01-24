@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 mod assets;
-use assets::{ensure_prefix_dir, cleanup_prefix_dir, get_pgdata_seed_path};
+use assets::{cleanup_prefix_dir, ensure_prefix_dir, get_pgdata_seed_path};
 use once_cell::sync::Lazy;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,7 +29,10 @@ fn detect_priority(data: &[u8]) -> QueryPriority {
     if data.len() > 5 && data[0] == b'Q' {
         // Find the null terminator to get the actual query string
         let query_bytes = &data[5..];
-        let query_end = query_bytes.iter().position(|&b| b == 0).unwrap_or(query_bytes.len());
+        let query_end = query_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(query_bytes.len());
 
         if let Ok(sql) = std::str::from_utf8(&query_bytes[..query_end]) {
             if is_high_priority_command(sql) {
@@ -46,7 +49,10 @@ fn detect_priority(data: &[u8]) -> QueryPriority {
             let query_start = 5 + name_end + 1;
             if query_start < data.len() {
                 let query_bytes = &data[query_start..];
-                let query_end = query_bytes.iter().position(|&b| b == 0).unwrap_or(query_bytes.len());
+                let query_end = query_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(query_bytes.len());
 
                 if let Ok(sql) = std::str::from_utf8(&query_bytes[..query_end]) {
                     if is_high_priority_command(sql) {
@@ -579,7 +585,9 @@ impl PgliteRuntime {
         let is_memory_mode = data_dir_str.starts_with("memory://");
 
         let prefix_dir = if let Some(prefix) = config.prefix_dir {
-            prefix.canonicalize().context("Failed to canonicalize prefix directory")?
+            prefix
+                .canonicalize()
+                .context("Failed to canonicalize prefix directory")?
         } else {
             ensure_prefix_dir()?
         };
@@ -864,10 +872,7 @@ impl AsyncPgliteExecutor {
 
         let priority = detect_priority(&query);
 
-        let request = QueryRequest {
-            query,
-            response_tx,
-        };
+        let request = QueryRequest { query, response_tx };
 
         let send_result = match priority {
             QueryPriority::High => self.high_priority_tx.send(request).await,
@@ -1021,15 +1026,14 @@ pub fn handle_connection(mut stream: TcpStream, runtime: Arc<PgliteRuntime>) -> 
     let mut buf = vec![0u8; 64 * 1024];
     let mut has_sent_server_version = false;
 
-    let rt = tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime")
-                .handle()
-                .clone()
-        });
+    let rt = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+            .handle()
+            .clone()
+    });
 
     loop {
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -1037,7 +1041,8 @@ pub fn handle_connection(mut stream: TcpStream, runtime: Arc<PgliteRuntime>) -> 
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let _permit = rt.block_on(WASM_SEMAPHORE.acquire())
+                let _permit = rt
+                    .block_on(WASM_SEMAPHORE.acquire())
                     .expect("Semaphore closed");
 
                 match runtime.process_wire_message(&buf[..n]) {

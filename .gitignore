@@ -3,3 +3,9 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+
+# Auto-generated assets (downloaded/compiled by build.rs)
+assets/pglite.wasi
+assets/pglite.cwasm
+assets/prefix.tar.zst
+assets/pgdata_seed.tar.zst
