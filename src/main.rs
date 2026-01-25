@@ -1,23 +1,19 @@
-//! PGlite Port - Wasmtime-based PostgreSQL runtime
+//! PGlite Port - QuickJS PGlite runtime
 //!
-//! Usage: pglited <data_dir> <tcp_port> <wasm_path> <prefix_dir> [pgdata_seed_path]
+//! Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>]
 //!
 //! Arguments:
-//!   data_dir         - Directory for PostgreSQL data (will be created if missing)
-//!   tcp_port         - TCP port to listen on for PostgreSQL connections
-//!   wasm_path        - Path to the pglite.wasi binary
-//!   prefix_dir       - Directory containing pglite prefix files (share/postgresql/)
-//!   pgdata_seed_path - Optional: Path to pre-initialized PGDATA tarball (pgdata_seed.tar.zst)
+//!   data_dir - Directory for PostgreSQL data or memory://
+//!   tcp_port - TCP port to listen on for PostgreSQL connections
 //!
 //! Environment:
-//!   PGLITE_DEBUG=1   - Enable verbose debug output
+//!   PGLITE_DEBUG=1 - Enable verbose debug output
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
 use serde_json::json;
 use std::env;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,64 +34,45 @@ macro_rules! debug_log {
     };
 }
 
-struct ParsedArgs {
-    data_dir: PathBuf,
+enum Command {
+    Serve(ServeArgs),
+    DumpDataDir { output_path: String },
+}
+
+struct ServeArgs {
+    data_dir: String,
     tcp_port: u16,
-    wasm_path: Option<PathBuf>,
-    prefix_dir: Option<PathBuf>,
-    pgdata_seed_path: Option<PathBuf>,
     multiplexer_mode: Option<String>,
 }
 
-impl ParsedArgs {
+impl Command {
     fn parse() -> Result<Self> {
         let args: Vec<String> = env::args().collect();
+
+        if args.len() >= 2 && args[1] == "--dump-datadir" {
+            if args.len() < 3 {
+                eprintln!("Usage: {} --dump-datadir <output_path>", args[0]);
+                std::process::exit(1);
+            }
+            return Ok(Command::DumpDataDir {
+                output_path: args[2].clone(),
+            });
+        }
 
         if args.len() < 3 {
             Self::print_usage(&args[0]);
             std::process::exit(1);
         }
 
-        let data_dir = PathBuf::from(&args[1]);
+        let data_dir = args[1].clone();
         let tcp_port: u16 = args[2]
             .parse()
             .context("tcp_port must be a valid port number (1-65535)")?;
-
-        let mut wasm_path: Option<PathBuf> = None;
-        let mut prefix_dir: Option<PathBuf> = None;
-        let mut pgdata_seed_path: Option<PathBuf> = None;
         let mut multiplexer_mode: Option<String> = None;
 
         let mut i = 3;
         while i < args.len() {
             match args[i].as_str() {
-                "--wasm" | "--wasm-path" => {
-                    if i + 1 < args.len() {
-                        wasm_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    } else {
-                        eprintln!("Error: --wasm requires a path argument");
-                        std::process::exit(1);
-                    }
-                }
-                "--prefix" | "--prefix-dir" => {
-                    if i + 1 < args.len() {
-                        prefix_dir = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    } else {
-                        eprintln!("Error: --prefix requires a path argument");
-                        std::process::exit(1);
-                    }
-                }
-                "--pgdata-seed" => {
-                    if i + 1 < args.len() {
-                        pgdata_seed_path = Some(PathBuf::from(&args[i + 1]));
-                        i += 2;
-                    } else {
-                        eprintln!("Error: --pgdata-seed requires a path argument");
-                        std::process::exit(1);
-                    }
-                }
                 "--multiplexer" => {
                     if i + 1 < args.len() {
                         multiplexer_mode = Some(args[i + 1].clone());
@@ -110,66 +87,47 @@ impl ParsedArgs {
                     std::process::exit(1);
                 }
                 _ => {
-                    if wasm_path.is_none() {
-                        wasm_path = Some(PathBuf::from(&args[i]));
-                        i += 1;
-                    } else if prefix_dir.is_none() {
-                        prefix_dir = Some(PathBuf::from(&args[i]));
-                        i += 1;
-                    } else if pgdata_seed_path.is_none() {
-                        pgdata_seed_path = Some(PathBuf::from(&args[i]));
-                        i += 1;
-                    } else {
-                        eprintln!("Unknown argument: {}", args[i]);
-                        std::process::exit(1);
-                    }
+                    eprintln!("Unknown argument: {}", args[i]);
+                    std::process::exit(1);
                 }
             }
         }
 
-        Ok(Self {
+        Ok(Command::Serve(ServeArgs {
             data_dir,
             tcp_port,
-            wasm_path,
-            prefix_dir,
-            pgdata_seed_path,
             multiplexer_mode,
-        })
+        }))
     }
 
     fn print_usage(program_name: &str) {
-        eprintln!("Usage: {} <data_dir> <tcp_port> [wasm_path] [prefix_dir] [pgdata_seed_path] [--multiplexer <mode>]", program_name);
+        eprintln!(
+            "Usage: {} <data_dir> <tcp_port> [--multiplexer <mode>]",
+            program_name
+        );
+        eprintln!("       {} --dump-datadir <output_path>", program_name);
+        eprintln!();
+        eprintln!("Commands:");
+        eprintln!("  --dump-datadir <path>    - Dump initialized PostgreSQL data directory to a tar.gz file");
         eprintln!();
         eprintln!("Arguments:");
         eprintln!("  data_dir         - Directory for PostgreSQL data");
         eprintln!("  tcp_port         - TCP port for PostgreSQL connections");
-        eprintln!(
-            "  wasm_path        - Optional: Path to pglite.wasi binary (embedded if omitted)"
-        );
-        eprintln!("  prefix_dir       - Optional: Directory containing pglite prefix files (embedded if omitted)");
-        eprintln!("  pgdata_seed_path - Optional: Pre-initialized PGDATA tarball (faster startup)");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --wasm <path>           - Path to pglite.wasi binary");
-        eprintln!("  --prefix <path>          - Directory containing pglite prefix files");
-        eprintln!("  --pgdata-seed <path>     - Path to pre-initialized PGDATA tarball");
-        eprintln!("  --multiplexer <mode>      - Enable connection multiplexer (mode: queue)");
+        eprintln!("  --multiplexer <mode>     - Enable connection multiplexer (mode: queue)");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} memory:// 5432", program_name);
-        eprintln!(
-            "  {} /tmp/db 5432 /path/to/pglite.wasi /path/to/prefix",
-            program_name
-        );
+        eprintln!("  {} --dump-datadir pgdata_seed.tar.gz", program_name);
     }
+}
 
+impl ServeArgs {
     fn into_config(self) -> PgliteConfig {
         PgliteConfig {
             data_dir: self.data_dir,
             tcp_port: self.tcp_port,
-            wasm_path: self.wasm_path,
-            prefix_dir: self.prefix_dir,
-            pgdata_seed_path: self.pgdata_seed_path,
         }
     }
 }
@@ -206,45 +164,74 @@ fn setup_signal_handlers() {
 async fn main() -> Result<()> {
     setup_signal_handlers();
 
-    let parsed_args = ParsedArgs::parse()?;
+    let command = Command::parse()?;
 
-    debug_log!("=== PGlite Wasmtime Port ===");
-    debug_log!("Data Directory: {:?}", parsed_args.data_dir);
-    debug_log!("TCP Port: {}", parsed_args.tcp_port);
-    debug_log!("WASM Path: {:?}", parsed_args.wasm_path);
-    debug_log!("Prefix Directory: {:?}", parsed_args.prefix_dir);
-    if let Some(ref sp) = parsed_args.pgdata_seed_path {
-        debug_log!("PGDATA Seed: {:?}", sp);
+    match command {
+        Command::DumpDataDir { output_path } => {
+            return dump_datadir_command(&output_path).await;
+        }
+        Command::Serve(args) => {
+            return serve_command(args).await;
+        }
     }
-    if let Some(ref mode) = parsed_args.multiplexer_mode {
+}
+
+async fn dump_datadir_command(output_path: &str) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    eprintln!("Initializing PGlite to generate pgdata seed...");
+
+    let config = PgliteConfig {
+        data_dir: "memory://".to_string(),
+        tcp_port: 0,
+    };
+
+    let runtime = tokio::task::spawn_blocking(move || -> Result<PgliteRuntime> {
+        let mut runtime = PgliteRuntime::new(config)?;
+        runtime.init_postgres()?;
+        Ok(runtime)
+    })
+    .await??;
+
+    eprintln!("Dumping data directory...");
+    let data = runtime.dump_data_dir()?;
+
+    let mut file = File::create(output_path)?;
+    file.write_all(&data)?;
+
+    let size_mb = data.len() as f64 / 1024.0 / 1024.0;
+    eprintln!("Generated {} ({:.2} MB)", output_path, size_mb);
+
+    Ok(())
+}
+
+async fn serve_command(args: ServeArgs) -> Result<()> {
+    debug_log!("=== PGlite Wasmtime Port ===");
+    debug_log!("Data Directory: {:?}", args.data_dir);
+    debug_log!("TCP Port: {}", args.tcp_port);
+    if let Some(ref mode) = args.multiplexer_mode {
         debug_log!("Multiplexer Mode: {}", mode);
     }
     debug_log!("Process ID: {}", std::process::id());
 
-    let tcp_port = parsed_args.tcp_port;
-    let has_pgdata_seed = parsed_args.pgdata_seed_path.is_some();
-    let multiplexer_mode = parsed_args.multiplexer_mode.clone();
-    let config = parsed_args.into_config();
+    let tcp_port = args.tcp_port;
+    let multiplexer_mode = args.multiplexer_mode.clone();
+    let config = args.into_config();
 
     debug_log!("\n=== Step 1: Creating Runtime ===");
 
-    let runtime = tokio::task::spawn_blocking(move || -> Result<PgliteRuntime> {
+    let runtime = tokio::task::spawn_blocking(move || -> Result<Arc<PgliteRuntime>> {
         let mut runtime = PgliteRuntime::new(config)?;
 
-        debug_log!("✓ Runtime created");
-        debug_log!("  Data dir: {:?}", runtime.data_dir);
+        debug_log!("✓ Runtime created (PGlite JS)");
+        debug_log!("  Data dir: {}", runtime.data_dir);
 
         debug_log!("\n=== Step 2: Initializing PostgreSQL ===");
-        if has_pgdata_seed {
-            debug_log!("  Using PGDATA seed (skipping initdb)");
-        } else {
-            debug_log!("  No PGDATA seed, running initdb...");
-        }
-
         runtime.init_postgres()?;
         debug_log!("✓ PostgreSQL initialized");
 
-        Ok(runtime)
+        Ok(Arc::new(runtime))
     })
     .await;
 
@@ -280,7 +267,6 @@ async fn main() -> Result<()> {
     println!("{}", ready_json);
     debug_log!("✓ Ready signal sent to Elixir");
 
-    let runtime = Arc::new(runtime);
     let executor = Arc::new(AsyncPgliteExecutor::new(Arc::clone(&runtime)));
 
     debug_log!("\n=== Step 5: Accepting Connections ===");
