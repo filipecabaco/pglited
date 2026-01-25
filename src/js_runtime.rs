@@ -648,11 +648,16 @@ fn run_js_runtime(
             .execute_script(
                 "<exec_fn>",
                 r#"
-                globalThis.__pgliteExec = (buffer) => {
+                globalThis.__pgliteExec = (input) => {
                     const pg = globalThis.__pgliteInstance;
-                    const input = new Uint8Array(buffer);
+                    // input is already a Uint8Array from V8
                     const output = pg.execProtocolRawSync(input);
-                    return Array.from(new Uint8Array(output.buffer.slice(output.byteOffset, output.byteOffset + output.byteLength)));
+                    // Return Uint8Array directly - no Array.from() conversion needed
+                    if (output instanceof Uint8Array) {
+                        return output;
+                    }
+                    // If output is a different typed array view, create a proper Uint8Array
+                    return new Uint8Array(output.buffer, output.byteOffset, output.byteLength);
                 };
                 "#,
             )
@@ -661,16 +666,41 @@ fn run_js_runtime(
         let _ = ready_tx.send(Ok(()));
 
         loop {
-            match receiver.recv() {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(JsRequest::Exec(payload, response_tx)) => {
                     let result = exec_wire_message(&mut runtime, &payload);
                     let _ = response_tx.send(result);
+
+                    // Pump event loop to process any pending microtasks/promises
+                    // This prevents stalls when PGlite has internal async operations
+                    let _ = tokio_rt.block_on(async {
+                        runtime
+                            .run_event_loop(deno_core::PollEventLoopOptions {
+                                wait_for_inspector: false,
+                                pump_v8_message_loop: true,
+                            })
+                            .await
+                    });
                 }
                 Ok(JsRequest::DumpDataDir(response_tx)) => {
                     let result = dump_data_dir_sync(&mut runtime);
                     let _ = response_tx.send(result);
                 }
-                Ok(JsRequest::Shutdown) | Err(_) => break,
+                Ok(JsRequest::Shutdown) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Pump event loop during idle periods to keep timers/promises alive
+                    let _ = tokio_rt.block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_millis(1),
+                            runtime.run_event_loop(deno_core::PollEventLoopOptions {
+                                wait_for_inspector: false,
+                                pump_v8_message_loop: true,
+                            }),
+                        )
+                        .await
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
 
@@ -683,23 +713,67 @@ fn run_js_runtime(
 }
 
 fn exec_wire_message(runtime: &mut JsRuntime, payload: &[u8]) -> Result<Vec<u8>> {
-    let payload_array = format!(
-        "new Uint8Array([{}]).buffer",
-        payload
-            .iter()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    // Use V8's ArrayBuffer directly for zero-copy buffer passing
+    deno_core::scope!(scope, runtime);
 
-    let exec_code = format!("globalThis.__pgliteExec({})", payload_array);
+    // Create ArrayBuffer with the payload data
+    let backing_store =
+        v8::ArrayBuffer::new_backing_store_from_vec(payload.to_vec()).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+    let uint8_array = v8::Uint8Array::new(scope, array_buffer, 0, payload.len())
+        .ok_or_else(|| anyhow::anyhow!("Failed to create Uint8Array"))?;
 
-    let result_global = runtime
-        .execute_script("<exec>", exec_code)
-        .context("Failed to execute wire message")?;
+    // Get the exec function from global
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "__pgliteExec").unwrap();
+    let exec_fn = global
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow::anyhow!("__pgliteExec not found"))?;
+    let exec_fn = v8::Local::<v8::Function>::try_from(exec_fn)
+        .map_err(|_| anyhow::anyhow!("__pgliteExec is not a function"))?;
 
-    let bytes: Vec<u8> = extract_value(runtime, result_global)?;
-    Ok(bytes)
+    // Call with the Uint8Array directly
+    let undefined = v8::undefined(scope);
+    let args = [uint8_array.into()];
+    let result = exec_fn
+        .call(scope, undefined.into(), &args)
+        .ok_or_else(|| anyhow::anyhow!("__pgliteExec call failed"))?;
+
+    // Extract result - expect Uint8Array or ArrayBuffer
+    if result.is_uint8_array() {
+        let arr = v8::Local::<v8::Uint8Array>::try_from(result)
+            .map_err(|e| anyhow::anyhow!("Failed to convert to Uint8Array: {:?}", e))?;
+        let len = arr.byte_length();
+        let mut bytes = vec![0u8; len];
+        arr.copy_contents(&mut bytes);
+        Ok(bytes)
+    } else if result.is_array_buffer() {
+        let ab = v8::Local::<v8::ArrayBuffer>::try_from(result)
+            .map_err(|e| anyhow::anyhow!("Failed to convert to ArrayBuffer: {:?}", e))?;
+        let len = ab.byte_length();
+        let mut bytes = vec![0u8; len];
+        if let Some(data) = ab.data() {
+            // SAFETY: We're copying from valid V8 ArrayBuffer memory within the scope
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    bytes.as_mut_ptr(),
+                    len,
+                );
+            }
+        }
+        Ok(bytes)
+    } else if result.is_array_buffer_view() {
+        let view = v8::Local::<v8::ArrayBufferView>::try_from(result)
+            .map_err(|e| anyhow::anyhow!("Failed to convert to ArrayBufferView: {:?}", e))?;
+        let len = view.byte_length();
+        let mut bytes = vec![0u8; len];
+        view.copy_contents(&mut bytes);
+        Ok(bytes)
+    } else {
+        // Fallback to serde deserialization for arrays (legacy path)
+        serde_v8::from_v8(scope, result).context("Failed to deserialize V8 value")
+    }
 }
 
 fn dump_data_dir_sync(runtime: &mut JsRuntime) -> Result<Vec<u8>> {

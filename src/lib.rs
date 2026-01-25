@@ -283,6 +283,7 @@ fn ensure_server_version(response: Vec<u8>, has_sent_server_version: &mut bool) 
     }
 }
 
+#[allow(dead_code)]
 fn message_starts_transaction(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
@@ -359,11 +360,8 @@ pub async fn handle_connection_async(
             Err(e) => return Err(e).context("Failed to read from client"),
         };
 
-        let needs_init = !has_sent_server_version || message_starts_transaction(&buf[..n]);
-
-        if needs_init {
-            let _permit = WASM_SEMAPHORE.acquire().await;
-        }
+        // NOTE: Semaphore acquisition removed - executor handles serialization internally
+        // This prevents double semaphore acquisition deadlock
 
         match executor.execute_query(buf[..n].to_vec()).await {
             Ok(response) if !response.is_empty() => {
