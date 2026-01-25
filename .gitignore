@@ -3,3 +3,7 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+
+# All assets are auto-generated/downloaded by build.rs
+# The library is self-contained with no static assets committed
+assets/

@@ -1,13 +1,14 @@
 # pglited
 
-A Wasmtime-based PostgreSQL runtime that runs PostgreSQL via WebAssembly.
+A self-contained PostgreSQL runtime using V8 and PGlite WebAssembly.
 
 ## Features
 
 - **Single Binary Distribution**: All assets embedded in the binary - no external files required
-- **Fast Startup**: Optimized for quick initialization (~100ms)
+- **V8 JavaScript Runtime**: Uses Deno Core for high-performance JavaScript/WebAssembly execution
 - **Memory Mode**: Run entirely in-memory or with persistent storage
 - **Protocol Compatible**: Full PostgreSQL wire protocol support
+- **Auto-downloading Assets**: PGlite npm package downloaded and embedded at build time
 
 ## Quick Start
 
@@ -40,14 +41,18 @@ postgresql://postgres:password@127.0.0.1:5432/template1
 ## Command Line Options
 
 ```bash
-Usage: ./pglited <data_dir> <tcp_port> [wasm_path] [prefix_dir] [pgdata_seed_path]
+Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>]
+       pglited --dump-datadir <output_path>
+
+Commands:
+  --dump-datadir <path>    Dump initialized PostgreSQL data directory to a tar file
 
 Arguments:
-  data_dir         - Directory for PostgreSQL data (use memory:// for in-memory)
-  tcp_port         - TCP port for PostgreSQL connections
-  wasm_path        - Optional: Path to pglite.wasi binary (embedded if omitted)
-  prefix_dir       - Optional: Directory containing pglite prefix files (embedded if omitted)
-  pgdata_seed_path - Optional: Pre-initialized PGDATA tarball (faster startup)
+  data_dir         Directory for PostgreSQL data (use memory:// for in-memory)
+  tcp_port         TCP port for PostgreSQL connections
+
+Options:
+  --multiplexer <mode>     Enable connection multiplexer (mode: queue)
 ```
 
 ## Build Targets
@@ -59,6 +64,31 @@ make test              # Run all tests
 make clean             # Clean build artifacts
 ```
 
+## Configuration
+
+### PGlite Version
+
+The PGlite version is configured in `build.rs`:
+
+```rust
+const PGLITE_VERSION: &str = "0.3.15";
+const PGLITE_NPM_TARBALL: &str =
+    "https://registry.npmjs.org/@electric-sql/pglite/-/pglite-0.3.15.tgz";
+```
+
+To update PGlite:
+1. Edit the version in `build.rs`
+2. Delete `assets/pglite_npm/` to force re-download
+3. Rebuild: `cargo build --release`
+
+### PostgreSQL Server Version
+
+The reported PostgreSQL server version is configured in `src/lib.rs`:
+
+```rust
+const PGLITE_SERVER_VERSION: &str = "17.5";
+```
+
 ## Architecture
 
 ```
@@ -66,8 +96,8 @@ make clean             # Clean build artifacts
 │                            pglited                              │
 │                                                                 │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
-│  │  TCP Server  │───▶│ Wire Proto   │───▶│ Wasmtime Runtime │  │
-│  │ (127.0.0.1)  │◀───│   Handler    │◀───│   (PGlite WASM)  │  │
+│  │  TCP Server  │───▶│ Wire Proto   │───▶│   V8 Runtime     │  │
+│  │ (127.0.0.1)  │◀───│   Handler    │◀───│  (PGlite WASM)   │  │
 │  └──────────────┘    └──────────────┘    └──────────────────┘  │
 │         ▲                                         │             │
 │         │                                         ▼             │
@@ -80,37 +110,33 @@ make clean             # Clean build artifacts
 
 ## How It Works
 
-### Wasmtime Runtime
+### V8 JavaScript Runtime
 
-The binary uses [Wasmtime](https://wasmtime.dev/) to execute the PGlite WASM module:
+The binary uses [Deno Core](https://github.com/denoland/deno_core) to execute JavaScript and WebAssembly:
 
-- **Copy-on-write memory**: Uses `memory_init_cow(true)` for faster instantiation
-- **Lazy table initialization**: Defers table element initialization
-- **Pre-compiled modules**: Loads `.cwasm` files (native code) instead of recompiling WASM
-- **Dense memory images**: Pre-reserves 64MB for PostgreSQL's heap
+- **Embedded Assets**: PGlite npm package files embedded via rust-embed
+- **Custom Module Loader**: Resolves `pglite:///` URLs to embedded assets
+- **Polyfills**: TextEncoder/Decoder, fetch, Blob, URL, crypto, timers
+- **Zero-copy Buffers**: Direct V8 ArrayBuffer handling for wire protocol messages
+- **Dedicated Thread**: JavaScript runtime runs in isolated thread with message passing
 
 ### Memory vs Persistent Mode
 
 **Memory mode** (`memory://`):
-- Creates an isolated temporary directory per instance
-- Automatically cleaned up when the process exits
+- Creates an isolated in-memory database
+- Data lost when process exits
 - Perfect for testing and ephemeral workloads
 
 **Persistent mode** (any filesystem path):
 - Uses the specified directory for PGDATA
 - Data survives process restarts
 
-### Error Handling
+### Wire Protocol
 
-WASM traps are translated to appropriate PostgreSQL error codes:
-
-| WASM Function Pattern | PostgreSQL Code | Meaning |
-|-----------------------|-----------------|---------|
-| `parserOpenTable` | 42P01 | Undefined table |
-| `ParseFuncOrColumn` | 42883 | Undefined function |
-| `transformColumnRef` | 42703 | Undefined column |
-| `scanner_yyerror` | 42601 | Syntax error |
-| `ExecConstraints` | 23505 | Unique violation |
+The server implements PostgreSQL wire protocol handling:
+- Parses incoming wire messages (Query, Parse, Bind, Execute, etc.)
+- Injects `server_version` parameter on first response
+- Handles ReadyForQuery state tracking
 
 ## Environment Variables
 
@@ -123,25 +149,49 @@ cargo test
 ```
 
 Tests cover:
-- TCP socket binding
-- Wire protocol message parsing
-- Error code detection from WASM traps
-- Server version injection
+- **Wire Protocol Parsing**: Message iteration, truncated data, invalid lengths
+- **Server Version Injection**: Detection, creation, and injection logic
+- **TCP Socket Binding**: Port allocation and error handling
+- **Integration Tests**: Binary startup, ready signal, multiple instances, persistent storage
+
+### Test Summary
+
+- 20 unit tests in `src/lib.rs`
+- 4 integration tests in `tests/integration_test.rs`
 
 ## Asset Structure
 
-Assets are embedded in the binary at compile time:
+Assets are automatically downloaded and embedded at build time:
 
-- `assets/pglite.wasi` - PostgreSQL WASM module
-- `assets/pglite.cwasm` - Pre-compiled native code (faster startup)
-- `assets/pgdata_seed.tar.zst` - Pre-initialized database seed
-- `assets/prefix.tar.zst` - PostgreSQL share files
+```
+assets/
+└── pglite_npm/
+    └── dist/
+        ├── index.js           # PGlite entry point
+        ├── postgres.wasm      # PostgreSQL WebAssembly module
+        ├── postgres.data      # PostgreSQL data files
+        └── pgdata_seed.tar    # Pre-initialized database (generated)
+```
+
+The build process:
+1. Downloads `@electric-sql/pglite` npm tarball
+2. Extracts `dist/` contents to `assets/pglite_npm/dist/`
+3. Generates `pgdata_seed.tar` using the built binary (second build)
+4. Embeds all assets into the final binary via rust-embed
+
+## Dependencies
+
+Key runtime dependencies:
+- `deno_core` - V8 JavaScript runtime
+- `tokio` - Async runtime for TCP handling
+- `rust-embed` - Compile-time asset embedding
+- `anyhow` - Error handling
 
 ## Performance
 
 Key findings:
-- **Use pool_size: 1** - Higher pool sizes cause 55-88% performance degradation
-- **542 QPS reads**, **275 QPS writes**, **96 QPS transactions** (single instance)
+- **Use pool_size: 1** - Higher pool sizes cause performance degradation due to single-threaded PGlite
+- Typical performance: ~500 QPS reads, ~275 QPS writes, ~100 QPS transactions
 
 ## License
 
