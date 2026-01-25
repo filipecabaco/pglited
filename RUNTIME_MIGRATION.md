@@ -202,9 +202,83 @@ const tarball = await pg.dumpDataDir();
 | New V8/deno_core | ~1s | Low |
 | New V8 + loadDataDir | <1s | Medium |
 
+## Validation Against ex_pglite
+
+### Test Results
+
+All 24 ex_pglite integration tests pass with the new V8/deno_core implementation:
+
+```
+Running ExUnit with seed: 820154, max_cases: 3
+........................
+Finished in 17.9 seconds (17.9s async, 0.00s sync)
+24 tests, 0 failures
+```
+
+### Benchmark Results
+
+| Intensity | Target ops/s | Actual ops | Errors | Avg Latency | Memory | Status |
+|-----------|--------------|------------|--------|-------------|--------|--------|
+| Low (10/s) | 10 | 94 | 0% | 2.86ms | 575 MB | ✅ Works |
+| Medium (100/s) | 100 | 33 | 24% | 1815ms | 567 MB | ⚠️ Stalls |
+
+**Key Metrics (Low Intensity - 30s benchmark):**
+- Schema setup: 85ms (52ms DDL + 20ms seed)
+- Latency: Min 1.08ms, Max 15.37ms, P50 2.24ms, P95 7.61ms
+- Sustained throughput: ~3.13 ops/sec
+- Memory per instance: ~567-575 MB
+
+### Known Issue: High-Rate Query Stalling
+
+At higher query rates (medium/high intensity), the benchmark stalls after ~30-33 operations with Postgrex timeout errors:
+
+```
+Postgrex.Protocol disconnected: client timed out because it queued and
+checked out the connection for longer than 15000ms
+```
+
+**Observations:**
+- Sequential queries from psql work reliably (tested 30+ queries)
+- Postgrex extended query protocol works for individual connections
+- Issue manifests at higher throughput (~100 ops/sec target)
+- Exactly 33 operations complete before stall in medium intensity tests
+
+### Performance Regression vs Previous Implementation
+
+The previous Wasmtime implementation achieved higher sustained throughput. This regression needs investigation:
+
+| Metric | Previous (Wasmtime) | Current (V8/deno_core) |
+|--------|---------------------|------------------------|
+| Startup time | 2-9s (with seed) | ~1s |
+| Low intensity | Stable | ✅ Stable |
+| Medium intensity | Stable | ⚠️ Stalls after ~33 ops |
+| High intensity | Stable | ❌ Not tested |
+
+### Areas for Investigation
+
+1. **Wire Protocol Handling**
+   - The `execProtocolRawSync` may have blocking behavior at high rates
+   - Need to investigate if PGlite's sync execution causes V8 event loop issues
+   - Consider async wire protocol handling
+
+2. **V8 Event Loop**
+   - Current implementation uses synchronous `execute_script` for query execution
+   - May need to pump the event loop between queries
+   - Consider using `run_event_loop` periodically
+
+3. **Channel Back-pressure**
+   - The mpsc channel between TCP handler and JS runtime may cause blocking
+   - Consider bounded channels with back-pressure handling
+
+4. **Postgrex Compatibility**
+   - Extended query protocol (Parse/Bind/Execute) may have subtle differences
+   - Consider adding protocol-level debugging
+
 ## Potential Future Improvements
 
 1. **Add deno_web extension**: Would provide native TextEncoder, URL, etc.
 2. **Add deno_console extension**: Proper console implementation
 3. **Pre-compiled WASM module**: Use `wasmModule` option for even faster startup
 4. **Reduce polyfills**: Use more deno extensions for native implementations
+5. **Investigate wire protocol performance**: Address the high-rate query stalling issue
+6. **Add async query execution**: Consider making wire protocol handling async-aware

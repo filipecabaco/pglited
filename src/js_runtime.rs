@@ -665,50 +665,36 @@ fn run_js_runtime(
 
         let _ = ready_tx.send(Ok(()));
 
-        loop {
-            match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(JsRequest::Exec(payload, response_tx)) => {
-                    let result = exec_wire_message(&mut runtime, &payload);
-                    let _ = response_tx.send(result);
-
-                    // Pump event loop to process any pending microtasks/promises
-                    // This prevents stalls when PGlite has internal async operations
-                    let _ = tokio_rt.block_on(async {
-                        runtime
-                            .run_event_loop(deno_core::PollEventLoopOptions {
-                                wait_for_inspector: false,
-                                pump_v8_message_loop: true,
-                            })
-                            .await
-                    });
-                }
-                Ok(JsRequest::DumpDataDir(response_tx)) => {
-                    let result = dump_data_dir_sync(&mut runtime);
-                    let _ = response_tx.send(result);
-                }
-                Ok(JsRequest::Shutdown) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Pump event loop during idle periods to keep timers/promises alive
-                    let _ = tokio_rt.block_on(async {
-                        tokio::time::timeout(
-                            Duration::from_millis(1),
-                            runtime.run_event_loop(deno_core::PollEventLoopOptions {
-                                wait_for_inspector: false,
-                                pump_v8_message_loop: true,
-                            }),
-                        )
-                        .await
-                    });
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        Ok::<(), anyhow::Error>(())
+        // Exit the async context to run the message loop synchronously
+        // This avoids nested runtime issues
+        Ok::<JsRuntime, anyhow::Error>(runtime)
     });
 
-    if let Err(e) = result {
-        let _ = ready_tx.send(Err(e));
+    let mut runtime = match result {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+
+    // Message loop runs outside async context to avoid nested runtime issues
+    loop {
+        match receiver.recv() {
+            Ok(JsRequest::Exec(payload, response_tx)) => {
+                let result = exec_wire_message(&mut runtime, &payload);
+                let _ = response_tx.send(result);
+
+                // Pump event loop synchronously using v8's message loop
+                // This processes pending microtasks without needing tokio
+                runtime.v8_isolate().perform_microtask_checkpoint();
+            }
+            Ok(JsRequest::DumpDataDir(response_tx)) => {
+                let result = dump_data_dir_sync(&mut runtime, &tokio_rt);
+                let _ = response_tx.send(result);
+            }
+            Ok(JsRequest::Shutdown) | Err(_) => break,
+        }
     }
 }
 
@@ -776,7 +762,10 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: &[u8]) -> Result<Vec<u8>>
     }
 }
 
-fn dump_data_dir_sync(runtime: &mut JsRuntime) -> Result<Vec<u8>> {
+fn dump_data_dir_sync(
+    runtime: &mut JsRuntime,
+    tokio_rt: &tokio::runtime::Runtime,
+) -> Result<Vec<u8>> {
     runtime
         .execute_script(
             "<dump_setup>",
@@ -790,7 +779,8 @@ fn dump_data_dir_sync(runtime: &mut JsRuntime) -> Result<Vec<u8>> {
                     const pg = globalThis.__pgliteInstance;
                     const blob = await pg.dumpDataDir('none');
                     const arrayBuffer = await blob.arrayBuffer();
-                    globalThis.__dumpResult = Array.from(new Uint8Array(arrayBuffer));
+                    // Store as Uint8Array instead of Array for faster extraction
+                    globalThis.__dumpResult = new Uint8Array(arrayBuffer);
                 } catch (e) {
                     globalThis.__dumpError = String(e);
                 } finally {
@@ -801,19 +791,10 @@ fn dump_data_dir_sync(runtime: &mut JsRuntime) -> Result<Vec<u8>> {
         )
         .context("Failed to start dump")?;
 
-    loop {
-        let done_global = runtime
-            .execute_script("<dump_check>", "globalThis.__dumpDone")
-            .context("Failed to check dump status")?;
-        let done: bool = extract_value(runtime, done_global)?;
-
-        if done {
-            break;
-        }
-
-        runtime.execute_script("<pump>", "0").ok();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // Use tokio runtime to properly run the event loop for async operations
+    tokio_rt.block_on(async {
+        runtime.run_event_loop(Default::default()).await
+    })?;
 
     let error_global = runtime
         .execute_script("<dump_error>", "globalThis.__dumpError")
@@ -824,12 +805,26 @@ fn dump_data_dir_sync(runtime: &mut JsRuntime) -> Result<Vec<u8>> {
         return Err(anyhow::anyhow!("Dump error: {}", e));
     }
 
-    let result_global = runtime
-        .execute_script("<dump_result>", "globalThis.__dumpResult")
-        .context("Failed to get dump result")?;
+    // Extract result using proper TypedArray handling
+    deno_core::scope!(scope, runtime);
+    let result_global = {
+        let key = v8::String::new(scope, "__dumpResult").unwrap();
+        let global = scope.get_current_context().global(scope);
+        global.get(scope, key.into())
+    };
 
-    let bytes: Vec<u8> = extract_value(runtime, result_global)?;
-    Ok(bytes)
+    if let Some(result) = result_global {
+        if result.is_uint8_array() {
+            let arr = v8::Local::<v8::Uint8Array>::try_from(result)
+                .map_err(|e| anyhow::anyhow!("Failed to convert dump result: {:?}", e))?;
+            let len = arr.byte_length();
+            let mut bytes = vec![0u8; len];
+            arr.copy_contents(&mut bytes);
+            return Ok(bytes);
+        }
+    }
+
+    Err(anyhow::anyhow!("Dump result not available"))
 }
 
 fn normalize_data_dir(data_dir: &str) -> String {
