@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn has_server_version_returns_true_when_present() {
-        let msg = create_wire_message(b'S', b"server_version\017.5\0");
+        let msg = create_wire_message(b'S', b"server_version\x0017.5\0");
 
         assert!(has_server_version(&msg));
     }
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn ensure_server_version_marks_flag_when_version_present() {
-        let data = create_wire_message(b'S', b"server_version\017.5\0");
+        let data = create_wire_message(b'S', b"server_version\x0017.5\0");
         let mut flag = false;
 
         let result = ensure_server_version(data.clone(), &mut flag);
