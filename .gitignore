@@ -4,8 +4,6 @@ Cargo.lock
 *.swo
 .DS_Store
 
-# Auto-generated assets (downloaded/compiled by build.rs)
-assets/pglite.wasi
-assets/pglite.cwasm
-assets/prefix.tar.zst
-assets/pgdata_seed.tar.zst
+# All assets are auto-generated/downloaded by build.rs
+# The library is self-contained with no static assets committed
+assets/
