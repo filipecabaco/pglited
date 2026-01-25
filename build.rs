@@ -119,10 +119,7 @@ fn ensure_pgdata_seed() {
                     let size = fs::metadata(seed_path)
                         .map(|m| m.len() as f64 / 1024.0 / 1024.0)
                         .unwrap_or(0.0);
-                    println!(
-                        "cargo:warning=Generated pgdata_seed.tar ({:.2} MB)",
-                        size
-                    );
+                    println!("cargo:warning=Generated pgdata_seed.tar ({:.2} MB)", size);
                 } else {
                     println!("cargo:warning=pgdata_seed generation completed but file not found");
                 }
@@ -135,10 +132,7 @@ fn ensure_pgdata_seed() {
             }
         }
         Err(e) => {
-            println!(
-                "cargo:warning=Failed to run pglited binary: {}",
-                e
-            );
+            println!("cargo:warning=Failed to run pglited binary: {}", e);
             println!("cargo:warning=Build once, then rebuild to generate pgdata_seed");
         }
     }

@@ -11,12 +11,6 @@ pub use js_runtime::PgliteRuntime;
 
 static WASM_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::const_new(1));
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryPriority {
-    High,
-    Normal,
-}
-
 pub struct PgliteConfig {
     pub data_dir: String,
     pub tcp_port: u16,
@@ -71,59 +65,6 @@ impl<'a> Iterator for WireMessageIter<'a> {
     }
 }
 
-fn detect_priority(data: &[u8]) -> QueryPriority {
-    if data.len() > 5 && data[0] == b'Q' {
-        let query_bytes = &data[5..];
-        let query_end = query_bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(query_bytes.len());
-
-        if let Ok(sql) = std::str::from_utf8(&query_bytes[..query_end]) {
-            if is_high_priority_command(sql) {
-                return QueryPriority::High;
-            }
-        }
-    }
-
-    if data.len() > 5 && data[0] == b'P' {
-        if let Some(name_end) = data[5..].iter().position(|&b| b == 0) {
-            let query_start = 5 + name_end + 1;
-            if query_start < data.len() {
-                let query_bytes = &data[query_start..];
-                let query_end = query_bytes
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(query_bytes.len());
-
-                if let Ok(sql) = std::str::from_utf8(&query_bytes[..query_end]) {
-                    if is_high_priority_command(sql) {
-                        return QueryPriority::High;
-                    }
-                }
-            }
-        }
-    }
-
-    QueryPriority::Normal
-}
-
-#[inline]
-fn is_high_priority_command(sql: &str) -> bool {
-    let trimmed = sql.trim();
-    let first_word = trimmed
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .next()
-        .unwrap_or("");
-
-    first_word.eq_ignore_ascii_case("COMMIT")
-        || first_word.eq_ignore_ascii_case("ROLLBACK")
-        || first_word.eq_ignore_ascii_case("END")
-        || first_word.eq_ignore_ascii_case("ABORT")
-        || first_word.eq_ignore_ascii_case("SAVEPOINT")
-        || first_word.eq_ignore_ascii_case("RELEASE")
-}
-
 pub struct AsyncPgliteExecutor {
     runtime: Arc<PgliteRuntime>,
 }
@@ -131,11 +72,6 @@ pub struct AsyncPgliteExecutor {
 impl AsyncPgliteExecutor {
     pub fn new(runtime: Arc<PgliteRuntime>) -> Self {
         Self { runtime }
-    }
-
-    #[allow(dead_code)]
-    pub fn from_wire_processor(runtime: Arc<dyn WireProcessor>) -> Self {
-        panic!("Use new() with Arc<PgliteRuntime> instead for optimal performance")
     }
 
     pub async fn execute_query(&self, query: Vec<u8>) -> Result<Vec<u8>> {
@@ -203,17 +139,6 @@ fn ensure_server_version(response: Vec<u8>, has_sent_server_version: &mut bool) 
     } else {
         response
     }
-}
-
-#[allow(dead_code)]
-fn message_starts_transaction(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    matches!(
-        data[0],
-        b'P' | b'Q' | b'B' | b'E' | b'D' | b'C' | b'H' | b'F'
-    )
 }
 
 pub fn handle_connection(mut stream: TcpStream, runtime: Arc<dyn WireProcessor>) -> Result<()> {
@@ -297,4 +222,210 @@ pub async fn handle_connection_async(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_wire_message(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let msg_len = (4 + payload.len()) as u32;
+        let mut msg = Vec::with_capacity(1 + 4 + payload.len());
+        msg.push(msg_type);
+        msg.extend_from_slice(&msg_len.to_be_bytes());
+        msg.extend_from_slice(payload);
+        msg
+    }
+
+    #[test]
+    fn wire_message_iter_parses_single_message() {
+        let msg = create_wire_message(b'Q', b"SELECT 1\0");
+
+        let messages: Vec<_> = WireMessageIter::new(&msg).collect();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].msg_type, b'Q');
+        assert_eq!(messages[0].payload, b"SELECT 1\0");
+    }
+
+    #[test]
+    fn wire_message_iter_parses_multiple_messages() {
+        let mut data = create_wire_message(b'Q', b"SELECT 1\0");
+        data.extend(create_wire_message(b'Z', b"I"));
+
+        let messages: Vec<_> = WireMessageIter::new(&data).collect();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].msg_type, b'Q');
+        assert_eq!(messages[1].msg_type, b'Z');
+        assert_eq!(messages[1].payload, b"I");
+    }
+
+    #[test]
+    fn wire_message_iter_handles_empty_data() {
+        let messages: Vec<_> = WireMessageIter::new(&[]).collect();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn wire_message_iter_handles_truncated_header() {
+        let messages: Vec<_> = WireMessageIter::new(&[b'Q', 0, 0]).collect();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn wire_message_iter_handles_invalid_length() {
+        let mut msg = vec![b'Q'];
+        msg.extend_from_slice(&3u32.to_be_bytes());
+
+        let messages: Vec<_> = WireMessageIter::new(&msg).collect();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn wire_message_iter_handles_truncated_payload() {
+        let mut msg = vec![b'Q'];
+        msg.extend_from_slice(&100u32.to_be_bytes());
+        msg.extend_from_slice(b"short");
+
+        let messages: Vec<_> = WireMessageIter::new(&msg).collect();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn has_server_version_returns_true_when_present() {
+        let msg = create_wire_message(b'S', b"server_version\017.5\0");
+
+        assert!(has_server_version(&msg));
+    }
+
+    #[test]
+    fn has_server_version_returns_false_when_absent() {
+        let msg = create_wire_message(b'S', b"other_param\0value\0");
+
+        assert!(!has_server_version(&msg));
+    }
+
+    #[test]
+    fn has_server_version_returns_false_for_non_s_message() {
+        let msg = create_wire_message(b'Q', b"server_version\0value\0");
+
+        assert!(!has_server_version(&msg));
+    }
+
+    #[test]
+    fn create_server_version_message_has_correct_format() {
+        let msg = create_server_version_message();
+
+        assert_eq!(msg[0], b'S');
+
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
+        assert_eq!(msg.len(), 1 + 4 + len - 4);
+
+        let payload = &msg[5..];
+        assert!(payload.starts_with(b"server_version\0"));
+        assert!(payload.ends_with(b"\0"));
+    }
+
+    #[test]
+    fn find_ready_for_query_returns_position() {
+        let mut data = create_wire_message(b'S', b"param\0value\0");
+        let rfq_pos = data.len();
+        data.extend(create_wire_message(b'Z', b"I"));
+
+        let pos = find_ready_for_query(&data);
+
+        assert_eq!(pos, Some(rfq_pos));
+    }
+
+    #[test]
+    fn find_ready_for_query_returns_none_when_absent() {
+        let data = create_wire_message(b'S', b"param\0value\0");
+
+        assert!(find_ready_for_query(&data).is_none());
+    }
+
+    #[test]
+    fn ensure_server_version_returns_unchanged_when_empty() {
+        let mut flag = false;
+        let result = ensure_server_version(vec![], &mut flag);
+
+        assert!(result.is_empty());
+        assert!(!flag);
+    }
+
+    #[test]
+    fn ensure_server_version_returns_unchanged_when_already_sent() {
+        let data = create_wire_message(b'Z', b"I");
+        let mut flag = true;
+
+        let result = ensure_server_version(data.clone(), &mut flag);
+
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn ensure_server_version_marks_flag_when_version_present() {
+        let data = create_wire_message(b'S', b"server_version\017.5\0");
+        let mut flag = false;
+
+        let result = ensure_server_version(data.clone(), &mut flag);
+
+        assert_eq!(result, data);
+        assert!(flag);
+    }
+
+    #[test]
+    fn ensure_server_version_injects_before_ready_for_query() {
+        let mut data = create_wire_message(b'S', b"other\0value\0");
+        data.extend(create_wire_message(b'Z', b"I"));
+        let mut flag = false;
+
+        let result = ensure_server_version(data.clone(), &mut flag);
+
+        assert!(result.len() > data.len());
+        assert!(flag);
+        assert!(has_server_version(&result));
+    }
+
+    #[test]
+    fn ensure_server_version_returns_unchanged_without_ready_for_query() {
+        let data = create_wire_message(b'S', b"other\0value\0");
+        let mut flag = false;
+
+        let result = ensure_server_version(data.clone(), &mut flag);
+
+        assert_eq!(result, data);
+        assert!(!flag);
+    }
+
+    #[test]
+    fn bind_tcp_socket_succeeds_on_available_port() {
+        let listener = bind_tcp_socket(0).expect("Should bind to port 0");
+        let addr = listener.local_addr().expect("Should have local address");
+
+        assert!(addr.port() > 0);
+    }
+
+    #[test]
+    fn bind_tcp_socket_fails_on_privileged_port() {
+        let result = bind_tcp_socket(1);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pglite_config_stores_values() {
+        let config = PgliteConfig {
+            data_dir: "memory://test".to_string(),
+            tcp_port: 5432,
+        };
+
+        assert_eq!(config.data_dir, "memory://test");
+        assert_eq!(config.tcp_port, 5432);
+    }
 }

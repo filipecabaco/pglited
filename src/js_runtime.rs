@@ -812,11 +812,7 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8
         if let Some(data) = ab.data() {
             // SAFETY: We're copying from valid V8 ArrayBuffer memory within the scope
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr() as *const u8,
-                    bytes.as_mut_ptr(),
-                    len,
-                );
+                std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, bytes.as_mut_ptr(), len);
             }
         }
         Ok(bytes)
@@ -863,9 +859,7 @@ fn dump_data_dir_sync(
         .context("Failed to start dump")?;
 
     // Use tokio runtime to properly run the event loop for async operations
-    tokio_rt.block_on(async {
-        runtime.run_event_loop(Default::default()).await
-    })?;
+    tokio_rt.block_on(async { runtime.run_event_loop(Default::default()).await })?;
 
     let error_global = runtime
         .execute_script("<dump_error>", "globalThis.__dumpError")
