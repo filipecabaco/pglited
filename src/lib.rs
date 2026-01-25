@@ -3,7 +3,7 @@ use once_cell::sync::Lazy;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
+use tokio::sync::Semaphore;
 
 mod js_runtime;
 
@@ -45,6 +45,7 @@ impl<'a> WireMessageIter<'a> {
 impl<'a> Iterator for WireMessageIter<'a> {
     type Item = WireMessage<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset + 5 > self.data.len() {
             return None;
@@ -107,6 +108,7 @@ fn detect_priority(data: &[u8]) -> QueryPriority {
     QueryPriority::Normal
 }
 
+#[inline]
 fn is_high_priority_command(sql: &str) -> bool {
     let trimmed = sql.trim();
     let first_word = trimmed
@@ -114,112 +116,30 @@ fn is_high_priority_command(sql: &str) -> bool {
         .next()
         .unwrap_or("");
 
-    let upper = first_word.to_uppercase();
-
-    matches!(
-        upper.as_str(),
-        "COMMIT" | "ROLLBACK" | "END" | "ABORT" | "SAVEPOINT" | "RELEASE"
-    )
+    first_word.eq_ignore_ascii_case("COMMIT")
+        || first_word.eq_ignore_ascii_case("ROLLBACK")
+        || first_word.eq_ignore_ascii_case("END")
+        || first_word.eq_ignore_ascii_case("ABORT")
+        || first_word.eq_ignore_ascii_case("SAVEPOINT")
+        || first_word.eq_ignore_ascii_case("RELEASE")
 }
 
 pub struct AsyncPgliteExecutor {
-    high_priority_tx: mpsc::Sender<QueryRequest>,
-    normal_priority_tx: mpsc::Sender<QueryRequest>,
-    work_available: Arc<Notify>,
-}
-
-struct QueryRequest {
-    query: Vec<u8>,
-    response_tx: oneshot::Sender<Vec<u8>>,
+    runtime: Arc<PgliteRuntime>,
 }
 
 impl AsyncPgliteExecutor {
-    pub fn new(runtime: Arc<dyn WireProcessor>) -> Self {
-        let (high_priority_tx, high_priority_rx) = mpsc::channel::<QueryRequest>(100);
-        let (normal_priority_tx, normal_priority_rx) = mpsc::channel::<QueryRequest>(1000);
-        let work_available = Arc::new(Notify::new());
-        let work_available_clone = Arc::clone(&work_available);
+    pub fn new(runtime: Arc<PgliteRuntime>) -> Self {
+        Self { runtime }
+    }
 
-        tokio::spawn(async move {
-            let mut high_rx = high_priority_rx;
-            let mut normal_rx = normal_priority_rx;
-            let notify = work_available_clone;
-
-            loop {
-                tokio::select! {
-                    biased;
-                    result = high_rx.recv() => {
-                        if let Some(request) = result {
-                            let _permit = WASM_SEMAPHORE.acquire().await;
-                            let runtime_clone = Arc::clone(&runtime);
-                            let query = request.query;
-
-                            let response = tokio::task::spawn_blocking(move || {
-                                runtime_clone.process_wire_message(&query)
-                            }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("Task panicked")));
-
-                            match response {
-                                Ok(response) => {
-                                    let _ = request.response_tx.send(response);
-                                }
-                                Err(_) => {
-                                    let _ = request.response_tx.send(Vec::new());
-                                }
-                            }
-                        }
-                    }
-                    result = normal_rx.recv() => {
-                        match result {
-                            Some(request) => {
-                                let _permit = WASM_SEMAPHORE.acquire().await;
-                                let runtime_clone = Arc::clone(&runtime);
-                                let query = request.query;
-
-                                let response = tokio::task::spawn_blocking(move || {
-                                    runtime_clone.process_wire_message(&query)
-                                }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("Task panicked")));
-
-                                match response {
-                                    Ok(response) => {
-                                        let _ = request.response_tx.send(response);
-                                    }
-                                    Err(_) => {
-                                        let _ = request.response_tx.send(Vec::new());
-                                    }
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    _ = notify.notified() => {}
-                }
-            }
-        });
-
-        Self {
-            high_priority_tx,
-            normal_priority_tx,
-            work_available,
-        }
+    #[allow(dead_code)]
+    pub fn from_wire_processor(runtime: Arc<dyn WireProcessor>) -> Self {
+        panic!("Use new() with Arc<PgliteRuntime> instead for optimal performance")
     }
 
     pub async fn execute_query(&self, query: Vec<u8>) -> Result<Vec<u8>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        let priority = detect_priority(&query);
-        let request = QueryRequest { query, response_tx };
-        let send_result = match priority {
-            QueryPriority::High => self.high_priority_tx.send(request).await,
-            QueryPriority::Normal => self.normal_priority_tx.send(request).await,
-        };
-
-        if send_result.is_ok() {
-            self.work_available.notify_one();
-            response_rx
-                .await
-                .map_err(|_| anyhow::anyhow!("Query execution failed"))
-        } else {
-            Err(anyhow::anyhow!("Executor channel closed"))
-        }
+        self.runtime.process_wire_message_async(query).await
     }
 }
 
@@ -229,6 +149,7 @@ pub fn bind_tcp_socket(port: u16) -> Result<TcpListener> {
 
 const PGLITE_SERVER_VERSION: &str = "17.5";
 
+#[inline]
 fn has_server_version(response: &[u8]) -> bool {
     WireMessageIter::new(response)
         .any(|msg| msg.msg_type == b'S' && msg.payload.starts_with(b"server_version\0"))
@@ -249,6 +170,7 @@ fn create_server_version_message() -> Vec<u8> {
     msg
 }
 
+#[inline]
 fn find_ready_for_query(response: &[u8]) -> Option<usize> {
     let mut offset = 0;
     for msg in WireMessageIter::new(response) {

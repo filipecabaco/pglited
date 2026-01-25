@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
-use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime, WireProcessor};
+use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
 use serde_json::json;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,7 +221,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     debug_log!("\n=== Step 1: Creating Runtime ===");
 
-    let runtime = tokio::task::spawn_blocking(move || -> Result<Arc<dyn WireProcessor>> {
+    let runtime = tokio::task::spawn_blocking(move || -> Result<Arc<PgliteRuntime>> {
         let mut runtime = PgliteRuntime::new(config)?;
 
         debug_log!("✓ Runtime created (PGlite JS)");
@@ -231,8 +231,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         runtime.init_postgres()?;
         debug_log!("✓ PostgreSQL initialized");
 
-        let runtime = Arc::new(runtime);
-        Ok(runtime as Arc<dyn WireProcessor>)
+        Ok(Arc::new(runtime))
     })
     .await;
 

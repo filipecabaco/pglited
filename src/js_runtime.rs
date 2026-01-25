@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 use crate::{PgliteConfig, WireProcessor};
 
@@ -40,6 +41,7 @@ pub struct PgliteRuntime {
 
 enum JsRequest {
     Exec(Vec<u8>, mpsc::Sender<Result<Vec<u8>>>),
+    ExecAsync(Vec<u8>, oneshot::Sender<Result<Vec<u8>>>),
     DumpDataDir(mpsc::Sender<Result<Vec<u8>>>),
     Shutdown,
 }
@@ -63,6 +65,16 @@ impl PgliteRuntime {
             tcp_port: config.tcp_port,
             data_dir: config.data_dir,
         })
+    }
+
+    pub async fn process_wire_message_async(&self, data: Vec<u8>) -> Result<Vec<u8>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(JsRequest::ExecAsync(data, response_tx))
+            .map_err(|_| anyhow::anyhow!("Runtime channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Response channel closed"))?
     }
 
     pub fn init_postgres(&mut self) -> Result<()> {
@@ -248,9 +260,15 @@ fn run_js_runtime(
     };
 
     let result = tokio_rt.block_on(async {
+        // Configure V8 heap to avoid GC during startup and query processing
+        // Initial: 256MB, Max: 1GB
+        let create_params = v8::Isolate::create_params()
+            .heap_limits(256 * 1024 * 1024, 1024 * 1024 * 1024);
+
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![pglite_ext::init()],
             module_loader: Some(Rc::new(EmbeddedModuleLoader)),
+            create_params: Some(create_params),
             ..Default::default()
         });
 
@@ -653,18 +671,6 @@ fn run_js_runtime(
                     const mod = await import("pglite:///index.js");
                     const options = {{ dataDir: "{}" }};
 
-                    // pgdata_seed loading disabled - PGlite's built-in init is faster
-                    // To re-enable, uncomment the following:
-                    // try {{
-                    //     const seedResponse = await fetch("pglite:///pgdata_seed.tar");
-                    //     if (seedResponse.ok) {{
-                    //         const seedBuffer = await seedResponse.arrayBuffer();
-                    //         options.loadDataDir = new Blob([seedBuffer], {{ type: 'application/x-tar' }});
-                    //     }}
-                    // }} catch (e) {{
-                    //     // pgdata_seed not available, will run initdb
-                    // }}
-
                     const pg = await mod.PGlite.create(options);
                     globalThis.__pgliteInstance = pg;
                     globalThis.__pgliteIsReady = true;
@@ -744,7 +750,12 @@ fn run_js_runtime(
     loop {
         match receiver.recv() {
             Ok(JsRequest::Exec(payload, response_tx)) => {
-                let result = exec_wire_message(&mut runtime, &payload);
+                let result = exec_wire_message(&mut runtime, payload);
+                let _ = response_tx.send(result);
+                runtime.v8_isolate().perform_microtask_checkpoint();
+            }
+            Ok(JsRequest::ExecAsync(payload, response_tx)) => {
+                let result = exec_wire_message(&mut runtime, payload);
                 let _ = response_tx.send(result);
                 runtime.v8_isolate().perform_microtask_checkpoint();
             }
@@ -757,15 +768,16 @@ fn run_js_runtime(
     }
 }
 
-fn exec_wire_message(runtime: &mut JsRuntime, payload: &[u8]) -> Result<Vec<u8>> {
-    // Use V8's ArrayBuffer directly for zero-copy buffer passing
+#[inline]
+fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8>> {
+    // Use V8's ArrayBuffer directly - zero-copy since we own the Vec
+    let payload_len = payload.len();
     deno_core::scope!(scope, runtime);
 
-    // Create ArrayBuffer with the payload data
-    let backing_store =
-        v8::ArrayBuffer::new_backing_store_from_vec(payload.to_vec()).make_shared();
+    // Create ArrayBuffer using the owned Vec directly - no copy!
+    let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(payload).make_shared();
     let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
-    let uint8_array = v8::Uint8Array::new(scope, array_buffer, 0, payload.len())
+    let uint8_array = v8::Uint8Array::new(scope, array_buffer, 0, payload_len)
         .ok_or_else(|| anyhow::anyhow!("Failed to create Uint8Array"))?;
 
     // Get the exec function from global

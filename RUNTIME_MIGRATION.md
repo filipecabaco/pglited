@@ -336,10 +336,438 @@ pglited adds several layers that native PGlite doesn't have:
 
 **Conclusion**: The ~10x overhead is the expected cost of providing a real PostgreSQL-compatible interface. For the ex_pglite use case (Elixir applications), 0.7ms latency with 1000+ ops/sec throughput is excellent for an embedded database.
 
+## Performance Optimizations (January 2025)
+
+### Optimization Round 2: Async Executor Improvements
+
+After the initial performance fixes, further analysis identified additional bottlenecks in the async execution path.
+
+#### Bottlenecks Identified
+
+1. **Triple payload copy**: Request data was copied 3 times before reaching V8
+   - `buf[..n].to_vec()` in TCP handler
+   - `data.to_vec()` in `process_wire_message`
+   - `payload.to_vec()` in `exec_wire_message`
+
+2. **Unnecessary `spawn_blocking`**: The `AsyncPgliteExecutor` used `tokio::task::spawn_blocking` for every query, adding thread pool scheduling overhead
+
+3. **Redundant semaphore**: Double serialization via semaphore + JS runtime channel
+
+#### Optimizations Applied
+
+1. **Simplified `AsyncPgliteExecutor`** (`src/lib.rs`)
+   - Removed `spawn_blocking` overhead
+   - Removed redundant semaphore acquisition
+   - Direct async communication with runtime via tokio channels
+
+2. **Added async communication path** (`src/js_runtime.rs`)
+   - New `AsyncJsRequest` enum with tokio channels
+   - `process_wire_message_async()` method for non-blocking operation
+   - Dedicated async bridge thread for request forwarding
+
+3. **Zero-copy payload passing** (`src/js_runtime.rs`)
+   - `exec_wire_message()` now takes ownership of `Vec<u8>`
+   - Uses V8's `new_backing_store_from_vec()` directly without copying
+
+#### Benchmark Results: Before vs After Optimization
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **Throughput (high)** | 1125 ops/s | 1168 ops/s | **+3.8%** |
+| **P50 Latency** | 0.98ms | 0.95ms | **-3.1%** |
+| **P95 Latency** | 1.66ms | 1.52ms | **-8.4%** |
+| **P99 Latency** | 2.27ms | 1.94ms | **-14.5%** |
+| **Max Latency** | 16.14ms | 9.39ms | **-41.8%** |
+
+The most significant improvement is the **41.8% reduction in max latency**, eliminating tail latency spikes caused by thread pool scheduling.
+
+### Connection Pool Size Analysis
+
+Benchmarks were conducted with different Postgrex connection pool sizes to understand the impact on performance.
+
+#### Pool Size Comparison (1 vs 10 vs 20)
+
+| Intensity | Pool | Throughput | P50 | P95 | P99 | Max |
+|-----------|------|------------|-----|-----|-----|-----|
+| **Medium** | 1 | 500 ops/s | 0.70ms | 1.89ms | 2.26ms | 4.47ms |
+| **Medium** | 10 | 500 ops/s | 0.73ms | 1.88ms | 2.27ms | 4.64ms |
+| **Medium** | 20 | 500 ops/s | 0.63ms | 1.62ms | 1.87ms | 3.33ms |
+| **High** | 1 | 1168 ops/s | 0.95ms | 1.52ms | 1.94ms | 9.39ms |
+| **High** | 10 | 1119 ops/s | 0.99ms | 2.53ms | 4.65ms | 90.75ms |
+| **High** | 20 | **1223 ops/s** | 0.97ms | **1.48ms** | **1.79ms** | **3.62ms** |
+| **Extreme** | 1 | 1189 ops/s | 0.68ms | 2.41ms | 5.52ms | 12.76ms |
+| **Extreme** | 10 | 1266 ops/s | 0.56ms | 1.75ms | 2.11ms | 12.08ms |
+| **Extreme** | 20 | 1254 ops/s | 0.68ms | 2.22ms | 3.57ms | 12.18ms |
+
+#### Key Findings
+
+1. **Pool size 20 at high intensity is optimal**:
+   - Best throughput: 1223 ops/s (+4.7% vs pool 1)
+   - Best P95: 1.48ms (lowest across all configurations)
+   - Best P99: 1.79ms
+   - Best max latency: 3.62ms (vs 90.75ms with pool 10!)
+
+2. **Pool size 10 anomaly at high intensity**:
+   - Shows poor tail latency (90.75ms max)
+   - Likely a queueing edge case
+   - Pool 20 resolves this issue
+
+3. **Medium intensity**: Results are nearly identical across pool sizes (load doesn't saturate the system)
+
+4. **Extreme intensity**: Pool 10 slightly edges out pool 20 on P50/P95, all perform similarly
+
+#### Why Pool Size Matters
+
+The single-threaded JS runtime serializes all operations regardless of pool size. However:
+
+- **More connections** = requests can be pipelined and ready in the queue
+- **Less idle time** between operations at high load
+- **But more queueing delay** at moderate load (causing higher tail latency with pool 10)
+
+#### Recommendations
+
+| Use Case | Recommended Pool Size |
+|----------|----------------------|
+| Low/medium load (< 500 ops/s) | 1 (simplest configuration) |
+| High throughput with consistent latency | **20** (best overall) |
+| Maximum throughput (extreme load) | 10-20 (both perform well) |
+
+### Current Architecture (Post-Optimization)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     pglited binary                          │
+├─────────────────────────────────────────────────────────────┤
+│  TCP Server (tokio)                                         │
+│    ↓                                                        │
+│  AsyncPgliteExecutor (direct async, no spawn_blocking)      │
+│    ↓                                                        │
+│  Async Bridge Thread (tokio mpsc → std mpsc)                │
+│    ↓                                                        │
+│  JS Runtime Thread (dedicated, single-threaded)             │
+│    ↓                                                        │
+│  exec_wire_message (zero-copy payload to V8)                │
+│    ↓                                                        │
+│  PGlite.execProtocolRawSync (JavaScript)                    │
+│    ↓                                                        │
+│  pglite.wasm (PostgreSQL WebAssembly)                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Optimization Round 3: Compiler Settings and Inline Hints
+
+#### Changes Applied
+
+1. **Cargo profile optimization** (`Cargo.toml`)
+   - Changed `opt-level` from `"z"` (size) to `3` (performance)
+   - Changed `lto` from `true` to `"fat"` (more aggressive link-time optimization)
+
+2. **Hot path inline hints** (`src/lib.rs`, `src/js_runtime.rs`)
+   - Added `#[inline]` to `WireMessageIter::next()`
+   - Added `#[inline]` to `has_server_version()`
+   - Added `#[inline]` to `find_ready_for_query()`
+   - Added `#[inline]` to `is_high_priority_command()`
+   - Added `#[inline]` to `exec_wire_message()`
+
+3. **Allocation elimination** (`src/lib.rs`)
+   - Changed `is_high_priority_command()` to use `eq_ignore_ascii_case()` instead of `to_uppercase()`
+   - Eliminates one String allocation per query
+
+#### Benchmark Results: opt-level "z" vs opt-level 3
+
+| Metric | opt-level "z" | opt-level 3 | Improvement |
+|--------|---------------|-------------|-------------|
+| **Throughput (high)** | 1168 ops/s | 1262 ops/s | **+8.0%** |
+| **P50 Latency** | 0.95ms | 0.93ms | **-2.1%** |
+| **P95 Latency** | 1.52ms | 1.32ms | **-13.2%** |
+| **P99 Latency** | 1.94ms | 1.51ms | **-22.2%** |
+| **Max Latency** | 9.39ms | 3.09ms | **-67.1%** |
+
+**Trade-off**: Binary size increased from ~83MB to ~87MB (+5%), but performance improved significantly.
+
+### Final Performance Summary (After All Optimizations)
+
+| Intensity | Pool | Throughput | P50 | P95 | P99 | Max |
+|-----------|------|------------|-----|-----|-----|-----|
+| **High** | 1 | 1262 ops/s | 0.93ms | 1.32ms | 1.51ms | 3.09ms |
+| **High** | 20 | 1199 ops/s | 0.93ms | 1.42ms | 1.72ms | 4.99ms |
+| **Extreme** | 1 | 1210 ops/s | 0.66ms | 2.28ms | 2.95ms | 12.6ms |
+
+| Metric | Value |
+|--------|-------|
+| **Max Throughput** | 1,260+ ops/sec |
+| **P50 Latency** | 0.6-0.9ms |
+| **P95 Latency** | 1.3-2.3ms |
+| **P99 Latency** | 1.5-3.0ms |
+| **Error Rate** | 0% |
+| **Memory (per instance)** | 550-925 MB |
+| **Startup Time** | ~1 second |
+
+### Cumulative Improvement Summary
+
+| Optimization | Throughput | P99 Latency | Max Latency |
+|--------------|------------|-------------|-------------|
+| **Baseline** | 1125 ops/s | 2.27ms | 16.14ms |
+| **+ Async executor** | 1151 ops/s (+2%) | 2.21ms (-3%) | 4.84ms (-70%) |
+| **+ Zero-copy payload** | 1168 ops/s (+4%) | 1.94ms (-15%) | 9.39ms (-42%) |
+| **+ opt-level 3 + inline** | 1262 ops/s (+12%) | 1.51ms (-33%) | 3.09ms (-81%) |
+
+**Total improvement from baseline:**
+- **Throughput**: +12.2%
+- **P99 Latency**: -33.5%
+- **Max Latency**: -80.9%
+
+### Test Validation
+
+All tests pass after optimizations:
+- ✅ 4/4 pglited integration tests
+- ✅ 24/24 ex_pglite tests
+
+### Optimization Round 4: Channel Allocation Analysis
+
+Investigated whether eliminating intermediate channel allocation would improve performance.
+
+#### Previous Architecture (Async Path)
+```
+process_wire_message_async()
+    └── Create oneshot::channel()
+    └── Send AsyncJsRequest → async_sender (tokio::mpsc)
+
+Async Bridge Thread
+    └── Receive from async_receiver (tokio::mpsc)
+    └── Create mpsc::channel() for response
+    └── Send JsRequest::Exec → main sender (std::mpsc)
+    └── Wait for response
+    └── Forward to oneshot sender
+```
+
+This had **two channel allocations per request**: one `oneshot::channel()` and one `mpsc::channel()`.
+
+#### Optimized Architecture (Single Channel)
+```
+process_wire_message_async()
+    └── Create oneshot::channel()
+    └── Send JsRequest::ExecAsync → main sender (std::mpsc)
+
+JS Runtime Thread
+    └── Receive JsRequest::ExecAsync
+    └── Execute query
+    └── Send result via oneshot
+```
+
+Eliminated the async bridge thread entirely. Now uses a single `oneshot::channel()` per request.
+
+#### Benchmark Results
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| **Throughput** | 1262 ops/s | 1251 ops/s | -0.9% |
+| **P50 Latency** | 0.93ms | 0.93ms | Same |
+| **P95 Latency** | 1.32ms | 1.35ms | +2.3% |
+| **P99 Latency** | 1.51ms | 1.65ms | +9.3% |
+| **Max Latency** | 3.09ms | 4.06ms | +31.4% |
+
+#### Analysis
+
+The channel optimization had **negligible impact** because:
+
+1. **Dominant bottleneck is WASM execution**: The V8/WASM execution time (~0.7-1.0ms) dwarfs channel allocation overhead (~1-10μs)
+2. **Channel allocation is already fast**: Both `tokio::mpsc` and `std::mpsc` are highly optimized
+3. **Memory allocation patterns**: The Rust allocator efficiently reuses memory for small channel allocations
+
+#### Conclusion
+
+The simplification was kept for code clarity (removed ~30 lines, eliminated one thread), but performance remained within measurement variance. **The bottleneck is definitively the WASM execution, not Rust-side channel communication.**
+
+### Updated Architecture (Post-Optimization)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     pglited binary                          │
+├─────────────────────────────────────────────────────────────┤
+│  TCP Server (tokio)                                         │
+│    ↓                                                        │
+│  AsyncPgliteExecutor (creates oneshot per request)          │
+│    ↓                                                        │
+│  JsRequest::ExecAsync → std::mpsc::Sender                   │
+│    ↓                                                        │
+│  JS Runtime Thread (dedicated, single-threaded)             │
+│    ↓                                                        │
+│  exec_wire_message (zero-copy payload to V8)                │
+│    ↓                                                        │
+│  PGlite.execProtocolRawSync (JavaScript)                    │
+│    ↓                                                        │
+│  pglite.wasm (PostgreSQL WebAssembly)                       │
+│    ↓                                                        │
+│  Response via oneshot::Sender                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Optimization Round 5: V8 Runtime Configuration
+
+Investigated V8/deno_core runtime options for potential performance improvements.
+
+#### V8 Heap Configuration
+
+Added explicit V8 heap limits to avoid garbage collection during startup and query processing:
+
+```rust
+let create_params = v8::Isolate::create_params()
+    .heap_limits(256 * 1024 * 1024, 1024 * 1024 * 1024);  // 256MB initial, 1GB max
+
+let mut runtime = JsRuntime::new(RuntimeOptions {
+    create_params: Some(create_params),
+    // ...
+});
+```
+
+#### Benchmark Results
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| **Throughput** | 1251 ops/s | 1270 ops/s | +1.5% |
+| **P50 Latency** | 0.93ms | 0.94ms | Same |
+| **P95 Latency** | 1.35ms | 1.38ms | Same |
+| **P99 Latency** | 1.65ms | 1.58ms | -4.2% |
+
+**Conclusion**: The heap configuration had negligible performance impact. V8's dynamic heap sizing is already efficient. The configuration is kept for consistency and to prevent potential GC issues under sustained load.
+
+#### Response Path Zero-Copy Analysis
+
+Investigated whether the response path from V8 to Rust could be made zero-copy.
+
+**Current Response Path:**
+```
+PGlite.execProtocolRawSync() returns Uint8Array
+    └── V8 owns the ArrayBuffer backing store
+    └── Rust calls arr.copy_contents(&mut bytes)  ← COPY HERE
+    └── Returns Vec<u8> to caller
+```
+
+**Why Zero-Copy is Not Feasible:**
+
+1. **V8 Memory Ownership**: V8 manages its own heap via its allocator. The `BackingStore` of an ArrayBuffer is owned by V8's GC.
+
+2. **No Transfer Mechanism**: V8's `BackingStore` doesn't provide `into_vec()` or similar ownership transfer. Available methods:
+   - `data()` - raw pointer (must copy before scope ends)
+   - `Deref` to `&[Cell<u8>]` - borrowed slice (lifetime tied to V8)
+   - `detach()` - prevents JS access but doesn't give ownership to Rust
+
+3. **Cross-Allocator Issue**: Even with detachment, we can't safely create a `Vec<u8>` from V8-allocated memory because Rust's allocator didn't allocate it.
+
+4. **deno_core ops**: The `#[op2]` buffer handling (`JsBuffer`, `DetachedBuffer`) works for ops but not for direct V8 function calls. Converting to ops would add complexity without significant benefit.
+
+**Performance Impact Assessment:**
+
+| Response Size | Copy Time | Query Time | Copy % of Total |
+|---------------|-----------|------------|-----------------|
+| 1 KB | ~0.1 μs | ~900 μs | 0.01% |
+| 10 KB | ~1 μs | ~900 μs | 0.1% |
+| 100 KB | ~10 μs | ~900 μs | 1.1% |
+| 1 MB | ~100 μs | ~900 μs | 10% |
+
+For typical query responses (< 100 KB), the copy overhead is negligible. Zero-copy optimization is not worth the complexity.
+
+#### Other V8 Options Investigated
+
+| Option | Status | Notes |
+|--------|--------|-------|
+| **startup_snapshot** | Not implemented | Would require build-time snapshot generation. PGlite's ~1s startup is acceptable. |
+| **v8_platform** | Default | Custom platform could enable multi-threading but WASM is single-threaded. |
+| **skip_op_registration** | Default | Only ~1ms savings, not significant. |
+| **compiled_wasm_module_store** | Not applicable | Single-isolate architecture. |
+
+### Optimization Round 6: WASM/PGlite Configuration
+
+Investigated WebAssembly and PGlite-specific configuration options.
+
+#### PGlite Options Tested
+
+| Option | Result | Notes |
+|--------|--------|-------|
+| **relaxedDurability** | No improvement | For memory:// mode, adds checking overhead |
+| **initialMemory (128MB)** | Slight regression | Pre-allocation causes fragmentation |
+| **PostgreSQL SET commands** | Regression | Additional queries add startup overhead |
+
+**Conclusion**: Default PGlite configuration is optimal for in-memory mode. The options designed for IndexedDB persistence don't help with memory://.
+
+#### Maximum Performance by Workload Type
+
+Comprehensive benchmarking at different workload intensities (pool size 20):
+
+| Workload | Throughput | P50 | P95 | P99 | Notes |
+|----------|------------|-----|-----|-----|-------|
+| **Writes only** | **2616 ops/s** | 0.33ms | 0.47ms | 0.56ms | No result set transfer |
+| **Reads only** | **1641 ops/s** | 0.57ms | 0.84ms | 1.04ms | Result serialization overhead |
+| **Max (mixed)** | **1404 ops/s** | 0.53ms | 1.70ms | 2.17ms | Target 10000/s, bottleneck at ~1400 |
+| **Extreme (mixed)** | **1310 ops/s** | 0.62ms | 1.97ms | 2.61ms | Similar to max |
+| **High (mixed)** | **1372 ops/s** | 0.85ms | 1.32ms | 1.63ms | Steady-state performance |
+| **Transactions only** | **518 ops/s** | 1.86ms | 3.50ms | 3.96ms | BEGIN/COMMIT overhead |
+
+#### Performance Analysis
+
+1. **Writes are fastest (2600 ops/s)**
+   - INSERT/UPDATE don't return result sets
+   - Minimal data transfer back to client
+   - P50 latency: 0.33ms
+
+2. **Reads are bottlenecked by serialization (1640 ops/s)**
+   - Result set must be serialized to wire protocol
+   - P50 latency: 0.57ms
+   - ~0.24ms overhead vs writes
+
+3. **Transactions are slowest (518 ops/s)**
+   - Each transaction requires BEGIN + operations + COMMIT
+   - ~3x slower than single operations
+   - P50 latency: 1.86ms
+
+4. **Mixed workloads plateau at ~1400 ops/s**
+   - Regardless of target rate, system saturates around 1400 ops/s
+   - This is the WASM/PostgreSQL execution ceiling
+
+#### Bottleneck Breakdown
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Write Operation (~0.33ms)                                    │
+│   └── PostgreSQL WASM execution                             │
+├─────────────────────────────────────────────────────────────┤
+│ Read Operation (~0.57ms)                                     │
+│   ├── PostgreSQL WASM execution (~0.33ms)                   │
+│   └── Result serialization + transfer (~0.24ms)             │
+├─────────────────────────────────────────────────────────────┤
+│ Transaction (~1.86ms)                                        │
+│   ├── BEGIN (~0.3ms)                                        │
+│   ├── Operations (~0.6ms)                                   │
+│   └── COMMIT (~0.9ms)                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Why Further Optimization is Limited
+
+1. **Single-threaded WASM**: PostgreSQL in WASM runs single-threaded; no parallelism possible
+2. **Emscripten overhead**: WASM compilation adds ~20-30% overhead vs native
+3. **Result serialization**: Wire protocol encoding happens in WASM
+4. **No shared memory**: Each query is a complete round-trip
+
+#### Recommendations
+
+| Use Case | Recommended Approach |
+|----------|---------------------|
+| High write throughput | Batch INSERTs, avoid transactions when possible |
+| High read throughput | Keep result sets small, use LIMIT |
+| Transaction-heavy | Consider batching operations within transactions |
+| Maximum throughput | Pool size 20, avoid reads returning large result sets |
+
 ## Potential Future Improvements
 
 1. **Add deno_web extension**: Would provide native TextEncoder, URL, etc. (would replace custom polyfills)
 2. **Add deno_console extension**: Proper console implementation
 3. **Pre-compiled WASM module**: Use `wasmModule` option for even faster startup
 4. **Reduce polyfills**: Use more deno extensions for native implementations
-5. **Further performance optimization**: Profile and optimize hot paths in wire protocol handling
+5. **Batch request processing**: Process multiple wire messages in a single V8 call
+6. **WASM optimization**: Would require upstream PGlite/PostgreSQL changes
+
+**Note on Response Path**: Zero-copy was investigated and found not feasible due to V8/Rust memory ownership constraints. The copy overhead (~0.1-10μs) is negligible compared to query execution (~300-600μs).
+
+**Note on WASM Performance**: The WASM execution (PostgreSQL in WebAssembly) is the fundamental bottleneck. Writes achieve 2600 ops/s, reads 1640 ops/s, transactions 518 ops/s. Further improvements would require changes to PGlite itself.
