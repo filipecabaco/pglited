@@ -488,8 +488,6 @@ jobs:
           echo "Running clippy lints..."
           cargo clippy --all-targets --all-features -- -D warnings
       
-      - name: Build to catch additional warnings
-        run: cargo build --all-targets --all-features
 
   lint-macos:
     name: Lint (macOS)
@@ -544,5 +542,3 @@ jobs:
           echo "Running clippy lints..."
           cargo clippy --all-targets --all-features -- -D warnings
       
-      - name: Build to catch additional warnings
-        run: cargo build --all-targets --all-features
