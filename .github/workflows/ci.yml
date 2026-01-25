@@ -55,10 +55,8 @@ jobs:
       - name: Cache downloaded assets
         uses: actions/cache@v4
         with:
-          path: |
-            assets/pglite.wasi
-            assets/prefix.tar.zst
-          key: pglite-wasi-assets-v1
+          path: assets/pglite_npm
+          key: pglite-npm-assets-v1
 
       - name: Build release binary
         run: cargo build --release
@@ -127,10 +125,8 @@ jobs:
       - name: Cache downloaded assets
         uses: actions/cache@v4
         with:
-          path: |
-            assets/pglite.wasi
-            assets/prefix.tar.zst
-          key: pglite-wasi-assets-v1
+          path: assets/pglite_npm
+          key: pglite-npm-assets-v1
 
       - name: Build release binary
         run: cargo build --release
@@ -207,10 +203,8 @@ jobs:
       - name: Cache downloaded assets
         uses: actions/cache@v4
         with:
-          path: |
-            assets/pglite.wasi
-            assets/prefix.tar.zst
-          key: pglite-wasi-assets-v1
+          path: assets/pglite_npm
+          key: pglite-npm-assets-v1
 
       - name: Run unit tests
         run: cargo test --lib
@@ -225,13 +219,16 @@ jobs:
         run: |
           echo "======================================================================"
           echo "Testing binary startup with memory mode..."
-          echo "This test verifies that pgdata_seed.tar.zst was generated correctly"
+          echo "This test verifies that pgdata_seed.tar was generated correctly"
           echo "With proper seed, startup should be < 10 seconds (~100ms expected)"
           echo "======================================================================"
           echo ""
 
+          # Make binary executable (downloaded artifacts lose permissions)
+          chmod +x ./target/release/pglited
+
           # Start the binary in memory mode
-          timeout 10s ./target/release/pglited memory:// 5432 > /tmp/pglited_startup.log 2>&1 &
+          ./target/release/pglited memory:// 5432 > /tmp/pglited_startup.log 2>&1 &
           PID=$!
 
           echo "Started pglited with PID: $PID"
@@ -256,7 +253,7 @@ jobs:
           if [ -z "$READY_SIGNAL" ]; then
             echo "❌ FAILED: Ready signal not received within 10 seconds"
             echo ""
-            echo "This indicates pgdata_seed.tar.zst may be corrupted."
+            echo "This indicates pgdata_seed.tar may be corrupted."
             echo "Without the seed, PostgreSQL needs to run initdb which takes much longer."
             echo ""
             echo "Last 50 lines of output:"
@@ -348,10 +345,8 @@ jobs:
       - name: Cache downloaded assets
         uses: actions/cache@v4
         with:
-          path: |
-            assets/pglite.wasi
-            assets/prefix.tar.zst
-          key: pglite-wasi-assets-v1
+          path: assets/pglite_npm
+          key: pglite-npm-assets-v1
 
       - name: Run unit tests
         run: cargo test --lib
@@ -366,13 +361,16 @@ jobs:
         run: |
           echo "======================================================================"
           echo "Testing binary startup with memory mode..."
-          echo "This test verifies that pgdata_seed.tar.zst was generated correctly"
+          echo "This test verifies that pgdata_seed.tar was generated correctly"
           echo "With proper seed, startup should be < 10 seconds (~100ms expected)"
           echo "======================================================================"
           echo ""
 
-          # Start the binary in memory mode
-          timeout 10s ./target/release/pglited memory:// 5432 > /tmp/pglited_startup.log 2>&1 &
+          # Make binary executable (downloaded artifacts lose permissions)
+          chmod +x ./target/release/pglited
+
+          # Start the binary in memory mode (no timeout command - macOS doesn't have it)
+          ./target/release/pglited memory:// 5432 > /tmp/pglited_startup.log 2>&1 &
           PID=$!
 
           echo "Started pglited with PID: $PID"
@@ -397,7 +395,7 @@ jobs:
           if [ -z "$READY_SIGNAL" ]; then
             echo "❌ FAILED: Ready signal not received within 10 seconds"
             echo ""
-            echo "This indicates pgdata_seed.tar.zst may be corrupted."
+            echo "This indicates pgdata_seed.tar may be corrupted."
             echo "Without the seed, PostgreSQL needs to run initdb which takes much longer."
             echo ""
             echo "Last 50 lines of output:"
