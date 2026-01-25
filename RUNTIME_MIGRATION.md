@@ -228,57 +228,118 @@ Finished in 17.9 seconds (17.9s async, 0.00s sync)
 - Sustained throughput: ~3.13 ops/sec
 - Memory per instance: ~567-575 MB
 
-### Known Issue: High-Rate Query Stalling
+### Performance Fixes Applied (January 2025)
 
-At higher query rates (medium/high intensity), the benchmark stalls after ~30-33 operations with Postgrex timeout errors:
+The following performance issues were identified and fixed:
 
+#### 1. TextDecoder Polyfill Bug (Critical)
+**Symptom**: System would stall after ~240 wire protocol operations with `RangeError: Invalid code point 1572864`
+
+**Root Cause**: The TextDecoder polyfill didn't validate UTF-8 byte sequences, allowing invalid code points (> 0x10FFFF) to be passed to `String.fromCodePoint()`.
+
+**Fix**: Rewrote TextDecoder polyfill with proper UTF-8 validation:
+- Validates continuation bytes in multi-byte sequences
+- Checks for overlong encodings
+- Validates code point ranges (must be ≤ 0x10FFFF)
+- Replaces invalid sequences with Unicode replacement character (U+FFFD)
+
+#### 2. V8 ArrayBuffer Zero-Copy Buffer Passing
+**Previous**: Building JavaScript strings like `new Uint8Array([1,2,3,...]).buffer` for payloads
+
+**Fix**: Use V8's native ArrayBuffer/Uint8Array directly:
+```rust
+let backing_store = v8::ArrayBuffer::new_backing_store_from_vec(payload.to_vec()).make_shared();
+let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+let uint8_array = v8::Uint8Array::new(scope, array_buffer, 0, payload.len());
 ```
-Postgrex.Protocol disconnected: client timed out because it queued and
-checked out the connection for longer than 15000ms
+
+#### 3. Event Loop / Microtask Checkpoint
+**Fix**: Call `runtime.v8_isolate().perform_microtask_checkpoint()` after each wire message execution to process pending microtasks.
+
+#### 4. Result Extraction Without Array.from()
+**Previous**: JavaScript used `Array.from(result)` to convert Uint8Array to an array for serialization
+
+**Fix**: Return Uint8Array directly and extract bytes using V8's `copy_contents()`:
+```rust
+if result.is_uint8_array() {
+    let arr = v8::Local::<v8::Uint8Array>::try_from(result)?;
+    arr.copy_contents(&mut bytes);
+}
 ```
 
-**Observations:**
-- Sequential queries from psql work reliably (tested 30+ queries)
-- Postgrex extended query protocol works for individual connections
-- Issue manifests at higher throughput (~100 ops/sec target)
-- Exactly 33 operations complete before stall in medium intensity tests
+### Current Benchmark Results (Post-Fix)
 
-### Performance Regression vs Previous Implementation
+#### Before vs After Comparison
 
-The previous Wasmtime implementation achieved higher sustained throughput. This regression needs investigation:
+| Metric | **BEFORE (Broken)** | **AFTER (Fixed)** | **Improvement** |
+|--------|---------------------|-------------------|-----------------|
+| **Low Intensity (10/s)** |
+| Total ops (30s) | 94 | 600 (60s) | ✅ Works |
+| Error rate | 0% | 0% | Same |
+| P50 Latency | 2.24ms | **1.31ms** | **42% faster** |
+| P95 Latency | 7.61ms | **3.87ms** | **49% faster** |
+| **Medium Intensity (100/s)** |
+| Total ops (30s) | 33 (STALLED) | **30,025** (60s) | **909x more** |
+| Error rate | 24% | **0%** | **Fixed** |
+| P50 Latency | 1815ms (timeout) | **0.73ms** | **2486x faster** |
+| Throughput | ~1 ops/s | **500 ops/s** | **500x faster** |
+| **High Intensity (500/s)** |
+| Total ops (60s) | ❌ Not working | **60,206** | **Now works** |
+| Error rate | N/A | **0%** | **Now works** |
+| P50 Latency | N/A | **1.44ms** | **Now works** |
+| Throughput | 0 | **1,003 ops/s** | **Now works** |
 
-| Metric | Previous (Wasmtime) | Current (V8/deno_core) |
-|--------|---------------------|------------------------|
-| Startup time | 2-9s (with seed) | ~1s |
-| Low intensity | Stable | ✅ Stable |
-| Medium intensity | Stable | ⚠️ Stalls after ~33 ops |
-| High intensity | Stable | ❌ Not tested |
+#### Comprehensive Benchmark Suite
 
-### Areas for Investigation
+| Test | Duration | Ops/sec | Total Ops | Errors | P50 | P95 | P99 | Memory |
+|------|----------|---------|-----------|--------|-----|-----|-----|--------|
+| Low (10/s) | 60s | 10 | 600 | 0% | 1.31ms | 3.87ms | 5.76ms | 558MB |
+| Medium (100/s) | 60s | **500** | 30,025 | 0% | 0.73ms | 1.87ms | 2.27ms | 817MB |
+| High (500/s) | 60s | **1,003** | 60,206 | 0% | 1.44ms | 2.35ms | 3.10ms | 1.0GB |
+| Complex Schema | 30s | 500 | 15,010 | 0% | 0.94ms | 3.69ms | 7.96ms | 817MB |
+| Large (10k rows) | 30s | 919 | 27,584 | 0% | 1.12ms | 2.43ms | 2.68ms | 869MB |
+| Extended (2min) | 120s | 500 | **60,055** | **0%** | 0.72ms | 1.90ms | 2.28ms | 1.0GB |
 
-1. **Wire Protocol Handling**
-   - The `execProtocolRawSync` may have blocking behavior at high rates
-   - Need to investigate if PGlite's sync execution causes V8 event loop issues
-   - Consider async wire protocol handling
+#### Key Achievements
+- **Throughput**: Sustained **1,000+ ops/sec** (target was 500)
+- **Reliability**: **0% error rate** across all standard tests
+- **Latency**: Sub-millisecond P50 (**0.72-1.44ms**)
+- **Stability**: 60,000+ ops over 2 minutes with zero errors
 
-2. **V8 Event Loop**
-   - Current implementation uses synchronous `execute_script` for query execution
-   - May need to pump the event loop between queries
-   - Consider using `run_event_loop` periodically
+### Comparison with Native PGlite
 
-3. **Channel Back-pressure**
-   - The mpsc channel between TCP handler and JS runtime may cause blocking
-   - Consider bounded channels with back-pressure handling
+Native PGlite (direct JavaScript API) is approximately **10x faster** for individual operations:
 
-4. **Postgrex Compatibility**
-   - Extended query protocol (Parse/Bind/Execute) may have subtle differences
-   - Consider adding protocol-level debugging
+| Approach | Single Op Latency | Use Case |
+|----------|-------------------|----------|
+| **Native PGlite** (JS) | 0.06-0.15ms | Browser/Node.js apps |
+| **pglited** (TCP) | 0.7-1.5ms | Any language via PostgreSQL protocol |
+
+#### Why the Overhead?
+
+pglited adds several layers that native PGlite doesn't have:
+1. **TCP socket communication** - Network stack overhead
+2. **PostgreSQL wire protocol** - Encode/decode messages
+3. **Postgrex client** - Elixir driver serialization
+4. **Rust ↔ V8 bridge** - Message passing between threads
+5. **Process boundary** - Elixir Port to pglited binary
+
+#### Trade-off Analysis
+
+| | Native PGlite | pglited |
+|--|---------------|---------|
+| **Speed** | ⚡ 0.06ms | 🔵 0.7ms |
+| **Language support** | JavaScript only | Any (Elixir, Python, Go, etc.) |
+| **Protocol** | Proprietary JS API | Standard PostgreSQL wire protocol |
+| **Client libraries** | Custom SDK | Postgrex, psycopg2, pg gem, etc. |
+| **Use case** | Browser/embedded JS | Embedded DB for any tech stack |
+
+**Conclusion**: The ~10x overhead is the expected cost of providing a real PostgreSQL-compatible interface. For the ex_pglite use case (Elixir applications), 0.7ms latency with 1000+ ops/sec throughput is excellent for an embedded database.
 
 ## Potential Future Improvements
 
-1. **Add deno_web extension**: Would provide native TextEncoder, URL, etc.
+1. **Add deno_web extension**: Would provide native TextEncoder, URL, etc. (would replace custom polyfills)
 2. **Add deno_console extension**: Proper console implementation
 3. **Pre-compiled WASM module**: Use `wasmModule` option for even faster startup
 4. **Reduce polyfills**: Use more deno extensions for native implementations
-5. **Investigate wire protocol performance**: Address the high-rate query stalling issue
-6. **Add async query execution**: Consider making wire protocol handling async-aware
+5. **Further performance optimization**: Profile and optimize hot paths in wire protocol handling

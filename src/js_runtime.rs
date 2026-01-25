@@ -301,25 +301,80 @@ fn run_js_runtime(
                 }};
             }}
 
-            // TextDecoder polyfill (UTF-8 only)
+            // TextDecoder polyfill (UTF-8 only) with proper error handling
             if (typeof TextDecoder === 'undefined') {{
                 globalThis.TextDecoder = class TextDecoder {{
-                    constructor(encoding = 'utf-8') {{ this.encoding = encoding; }}
-                    decode(buf) {{
+                    constructor(encoding = 'utf-8', options = {{}}) {{
+                        this.encoding = encoding;
+                        this.fatal = options.fatal || false;
+                    }}
+                    decode(buf, options = {{}}) {{
+                        if (!buf) return '';
                         const arr = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
                         let str = '';
                         let i = 0;
+                        const REPLACEMENT_CHAR = '\uFFFD';
+
                         while (i < arr.length) {{
-                            let c = arr[i++];
-                            if (c < 128) {{
+                            const c = arr[i];
+
+                            // ASCII (0x00-0x7F)
+                            if (c < 0x80) {{
                                 str += String.fromCharCode(c);
-                            }} else if (c < 224) {{
-                                str += String.fromCharCode(((c & 31) << 6) | (arr[i++] & 63));
-                            }} else if (c < 240) {{
-                                str += String.fromCharCode(((c & 15) << 12) | ((arr[i++] & 63) << 6) | (arr[i++] & 63));
-                            }} else {{
-                                const cp = ((c & 7) << 18) | ((arr[i++] & 63) << 12) | ((arr[i++] & 63) << 6) | (arr[i++] & 63);
-                                str += String.fromCodePoint(cp);
+                                i++;
+                            }}
+                            // 2-byte sequence (0xC0-0xDF)
+                            else if (c >= 0xC0 && c < 0xE0) {{
+                                if (i + 1 >= arr.length || (arr[i + 1] & 0xC0) !== 0x80) {{
+                                    str += REPLACEMENT_CHAR;
+                                    i++;
+                                    continue;
+                                }}
+                                const cp = ((c & 0x1F) << 6) | (arr[i + 1] & 0x3F);
+                                // Check for overlong encoding
+                                if (cp < 0x80) {{
+                                    str += REPLACEMENT_CHAR;
+                                }} else {{
+                                    str += String.fromCharCode(cp);
+                                }}
+                                i += 2;
+                            }}
+                            // 3-byte sequence (0xE0-0xEF)
+                            else if (c >= 0xE0 && c < 0xF0) {{
+                                if (i + 2 >= arr.length || (arr[i + 1] & 0xC0) !== 0x80 || (arr[i + 2] & 0xC0) !== 0x80) {{
+                                    str += REPLACEMENT_CHAR;
+                                    i++;
+                                    continue;
+                                }}
+                                const cp = ((c & 0x0F) << 12) | ((arr[i + 1] & 0x3F) << 6) | (arr[i + 2] & 0x3F);
+                                // Check for overlong encoding and surrogate range
+                                if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) {{
+                                    str += REPLACEMENT_CHAR;
+                                }} else {{
+                                    str += String.fromCharCode(cp);
+                                }}
+                                i += 3;
+                            }}
+                            // 4-byte sequence (0xF0-0xF7)
+                            else if (c >= 0xF0 && c < 0xF8) {{
+                                if (i + 3 >= arr.length || (arr[i + 1] & 0xC0) !== 0x80 || (arr[i + 2] & 0xC0) !== 0x80 || (arr[i + 3] & 0xC0) !== 0x80) {{
+                                    str += REPLACEMENT_CHAR;
+                                    i++;
+                                    continue;
+                                }}
+                                const cp = ((c & 0x07) << 18) | ((arr[i + 1] & 0x3F) << 12) | ((arr[i + 2] & 0x3F) << 6) | (arr[i + 3] & 0x3F);
+                                // Check for valid code point range (must be <= 0x10FFFF and >= 0x10000 to avoid overlong)
+                                if (cp < 0x10000 || cp > 0x10FFFF) {{
+                                    str += REPLACEMENT_CHAR;
+                                }} else {{
+                                    str += String.fromCodePoint(cp);
+                                }}
+                                i += 4;
+                            }}
+                            // Invalid start byte
+                            else {{
+                                str += REPLACEMENT_CHAR;
+                                i++;
                             }}
                         }}
                         return str;
@@ -648,16 +703,23 @@ fn run_js_runtime(
             .execute_script(
                 "<exec_fn>",
                 r#"
+                globalThis.__pgliteExecCount = 0;
                 globalThis.__pgliteExec = (input) => {
-                    const pg = globalThis.__pgliteInstance;
-                    // input is already a Uint8Array from V8
-                    const output = pg.execProtocolRawSync(input);
-                    // Return Uint8Array directly - no Array.from() conversion needed
-                    if (output instanceof Uint8Array) {
-                        return output;
+                    const count = ++globalThis.__pgliteExecCount;
+                    try {
+                        const pg = globalThis.__pgliteInstance;
+                        // input is already a Uint8Array from V8
+                        const output = pg.execProtocolRawSync(input);
+                        // Return Uint8Array directly - no Array.from() conversion needed
+                        if (output instanceof Uint8Array) {
+                            return output;
+                        }
+                        // If output is a different typed array view, create a proper Uint8Array
+                        return new Uint8Array(output.buffer, output.byteOffset, output.byteLength);
+                    } catch (e) {
+                        console.error(`[JS] __pgliteExec #${count} error:`, String(e));
+                        throw e;
                     }
-                    // If output is a different typed array view, create a proper Uint8Array
-                    return new Uint8Array(output.buffer, output.byteOffset, output.byteLength);
                 };
                 "#,
             )
@@ -684,9 +746,6 @@ fn run_js_runtime(
             Ok(JsRequest::Exec(payload, response_tx)) => {
                 let result = exec_wire_message(&mut runtime, &payload);
                 let _ = response_tx.send(result);
-
-                // Pump event loop synchronously using v8's message loop
-                // This processes pending microtasks without needing tokio
                 runtime.v8_isolate().perform_microtask_checkpoint();
             }
             Ok(JsRequest::DumpDataDir(response_tx)) => {
@@ -723,7 +782,7 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: &[u8]) -> Result<Vec<u8>>
     let args = [uint8_array.into()];
     let result = exec_fn
         .call(scope, undefined.into(), &args)
-        .ok_or_else(|| anyhow::anyhow!("__pgliteExec call failed"))?;
+        .ok_or_else(|| anyhow::anyhow!("__pgliteExec call failed (JS exception or undefined)"))?;
 
     // Extract result - expect Uint8Array or ArrayBuffer
     if result.is_uint8_array() {
