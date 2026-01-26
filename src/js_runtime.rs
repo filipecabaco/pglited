@@ -479,6 +479,41 @@ impl ModuleLoader for EmbeddedModuleLoader {
             }
         };
 
+        // Patch index.js and fs/nodefs.js to inject fs/path modules for Emscripten NODEFS compatibility
+        // The bundled code uses its own require() that doesn't see our global require
+        // We inject code that overrides the bundle's module loading for fs and path
+        let code = if asset_path == "index.js" || asset_path == "fs/nodefs.js" {
+            let fs_injection = r#"
+// Inject fs and path modules for Emscripten NODEFS compatibility
+// This runs BEFORE the bundled code to ensure require() works for externalized modules
+var require = (function() {
+    var _require = function(moduleName) {
+        if (moduleName === 'fs' || moduleName === 'node:fs') {
+            return globalThis.fs;
+        }
+        if (moduleName === 'path' || moduleName === 'node:path') {
+            return globalThis.path;
+        }
+        // Check for process (stub it for Emscripten compatibility)
+        if (moduleName === 'process') {
+            return { platform: 'linux', env: {}, binding: function() { return {}; } };
+        }
+        throw new Error('Module not found: ' + moduleName);
+    };
+    // Also set it globally for any code that looks there
+    globalThis.require = _require;
+    return _require;
+})();
+// Ensure process global exists for Emscripten
+if (typeof process === 'undefined') {
+    globalThis.process = { platform: 'linux', env: {}, binding: function() { return {}; }, cwd: function() { return '/'; } };
+}
+"#;
+            format!("{}\n{}", fs_injection, code)
+        } else {
+            code
+        };
+
         ModuleLoadResponse::Sync(Ok(ModuleSource::new(
             ModuleType::JavaScript,
             ModuleSourceCode::String(FastString::from(code)),
