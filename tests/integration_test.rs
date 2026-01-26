@@ -43,6 +43,7 @@ impl TestInstance {
 
         let process = Command::new(&binary_path)
             .args([data_dir, &tcp_port.to_string()])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -295,17 +296,16 @@ fn test_ready_signal_format() {
 ///
 /// This test verifies that pglited can be connected to using a standard
 /// PostgreSQL client library, and that basic SQL operations work correctly.
-///
-/// NOTE: Currently ignored due to TCP binding issue - the server reports ready
-/// but TCP connections are refused. This is a pre-existing issue unrelated to
-/// file storage implementation.
 #[tokio::test]
-#[ignore = "TCP binding issue - server ready but connection refused"]
 async fn test_postgres_client_connectivity() {
     use tokio_postgres::NoTls;
 
     let data_dir = format!("memory://connectivity_test_{}", std::process::id());
-    let tcp_port = 55400 + (std::process::id() % 100) as u16;
+    // Use random port in ephemeral range to avoid conflicts
+    let tcp_port = 49152 + (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() % 10000) as u16;
 
     // Start instance
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
@@ -315,11 +315,45 @@ async fn test_postgres_client_connectivity() {
 
     println!("Instance ready on port {}", tcp_port);
 
-    // Connect using tokio-postgres
-    let connection_string = format!("host=127.0.0.1 port={} user=postgres", tcp_port);
-    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
-        .await
-        .expect("Failed to connect");
+    // Connect using tokio-postgres with retry logic
+    // PGlite accepts any password for the postgres user
+    let connection_string = format!("host=127.0.0.1 port={} user=postgres password=postgres", tcp_port);
+    let mut last_error = None;
+    let mut client_conn = None;
+
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                println!("Connected on attempt {}", attempt);
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                last_error = Some(e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = match client_conn {
+        Some(conn) => conn,
+        None => {
+            // Check if process is still running and get stderr
+            let status = instance.process.try_wait();
+            eprintln!("Process status after connection failures: {:?}", status);
+            if let Ok(Some(exit_status)) = status {
+                if let Some(stderr) = instance.process.stderr.as_mut() {
+                    let mut stderr_output = String::new();
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut stderr_output);
+                    eprintln!("Process stderr:\n{}", stderr_output);
+                }
+                panic!("Process exited with status {} before connection succeeded", exit_status);
+            }
+            panic!("Failed to connect after 10 attempts: {:?}", last_error);
+        }
+    };
 
     // Spawn connection handler
     tokio::spawn(async move {
@@ -385,12 +419,7 @@ async fn test_postgres_client_connectivity() {
 /// 3. Stops the pglited instance
 /// 4. Starts a new pglited instance with the same data directory
 /// 5. Verifies the data is still present
-///
-/// NOTE: Currently ignored due to TCP binding issue - the server reports ready
-/// but TCP connections are refused. File storage initialization works correctly,
-/// as verified by test_persistent_storage_mode.
 #[tokio::test]
-#[ignore = "TCP binding issue - server ready but connection refused"]
 async fn test_file_storage_data_persists_on_reconnect() {
     use tokio_postgres::NoTls;
 
@@ -402,7 +431,11 @@ async fn test_file_storage_data_persists_on_reconnect() {
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
     let data_dir = temp_dir.to_str().unwrap().to_string();
-    let tcp_port = 55500 + (std::process::id() % 100) as u16;
+    // Use random port in ephemeral range to avoid conflicts
+    let tcp_port = 49152 + (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() % 10000) as u16;
 
     println!("=== Phase 1: Create data in new database ===");
     println!("Data directory: {}", data_dir);
@@ -417,10 +450,24 @@ async fn test_file_storage_data_persists_on_reconnect() {
     println!("First instance ready on port {}", tcp_port);
 
     // Connect and create data
-    let connection_string = format!("host=127.0.0.1 port={} user=postgres", tcp_port);
-    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
-        .await
-        .expect("Failed to connect to first instance");
+    let connection_string = format!("host=127.0.0.1 port={} user=postgres password=postgres", tcp_port);
+
+    // Retry connection with backoff
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                println!("Connected on attempt {}", attempt);
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    let (client, connection) = client_conn.expect("Failed to connect to first instance after retries");
 
     // Spawn connection handler
     tokio::spawn(async move {
@@ -473,10 +520,22 @@ async fn test_file_storage_data_persists_on_reconnect() {
 
     println!("Second instance ready on port {}", tcp_port);
 
-    // Connect to second instance
-    let (client2, connection2) = tokio_postgres::connect(&connection_string, NoTls)
-        .await
-        .expect("Failed to connect to second instance");
+    // Connect to second instance with retry
+    let mut client_conn2 = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                println!("Connected to second instance on attempt {}", attempt);
+                client_conn2 = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} to second instance failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    let (client2, connection2) = client_conn2.expect("Failed to connect to second instance after retries");
 
     tokio::spawn(async move {
         if let Err(e) = connection2.await {

@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
 use serde_json::json;
 use std::env;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -255,8 +256,14 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         }
     };
 
-    debug_log!("\n=== Step 3: Preparing TCP Socket ===");
-    debug_log!("  Will bind to 127.0.0.1:{}", tcp_port);
+    debug_log!("\n=== Step 3: Binding TCP Socket ===");
+    debug_log!("  Binding to 127.0.0.1:{}", tcp_port);
+
+    let tokio_listener = tokio::net::TcpListener::bind(("127.0.0.1", tcp_port))
+        .await
+        .context("Failed to bind Tokio TCP listener")?;
+
+    debug_log!("✓ Tokio TCP listener bound to 127.0.0.1:{}", tcp_port);
 
     debug_log!("\n=== Step 4: Ready ===");
     let ready_json = if let Some(ref mode) = multiplexer_mode {
@@ -265,17 +272,12 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         json!({"id": "ready", "success": true, "port": tcp_port})
     };
     println!("{}", ready_json);
-    debug_log!("✓ Ready signal sent to Elixir");
+    let _ = std::io::stdout().flush();
+    debug_log!("✓ Ready signal sent");
 
     let executor = Arc::new(AsyncPgliteExecutor::new(Arc::clone(&runtime)));
 
     debug_log!("\n=== Step 5: Accepting Connections ===");
-
-    let tokio_listener = tokio::net::TcpListener::bind(("127.0.0.1", tcp_port))
-        .await
-        .context("Failed to bind Tokio TCP listener")?;
-
-    debug_log!("✓ Tokio TCP listener bound to 127.0.0.1:{}", tcp_port);
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
