@@ -996,6 +996,205 @@ fn run_js_runtime(
                 }};
             }}
 
+            // Node.js fs module for Emscripten NODEFS compatibility
+            const fsModule = (() => {{
+                const {{ ops }} = Deno.core;
+
+                function createStats(stat) {{
+                    return {{
+                        isFile: () => stat.is_file,
+                        isDirectory: () => stat.is_directory,
+                        isSymbolicLink: () => stat.is_symlink,
+                        isBlockDevice: () => false,
+                        isCharacterDevice: () => false,
+                        isFIFO: () => false,
+                        isSocket: () => false,
+                        dev: 0,
+                        ino: 0,
+                        mode: stat.mode,
+                        nlink: 1,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: stat.size,
+                        blksize: 4096,
+                        blocks: Math.ceil(stat.size / 512),
+                        atimeMs: stat.atime_ms,
+                        mtimeMs: stat.mtime_ms,
+                        ctimeMs: stat.ctime_ms,
+                        birthtimeMs: stat.ctime_ms,
+                        atime: new Date(stat.atime_ms),
+                        mtime: new Date(stat.mtime_ms),
+                        ctime: new Date(stat.ctime_ms),
+                        birthtime: new Date(stat.ctime_ms),
+                    }};
+                }}
+
+                return {{
+                    existsSync: (path) => ops.op_fs_exists_sync(path),
+                    mkdirSync: (path, options) => {{
+                        const recursive = options?.recursive ?? false;
+                        ops.op_fs_mkdir_sync(path, recursive);
+                    }},
+                    readFileSync: (path, options) => {{
+                        const data = ops.op_fs_read_file_sync(path);
+                        if (options?.encoding === 'utf8' || options?.encoding === 'utf-8') {{
+                            return new TextDecoder().decode(data);
+                        }}
+                        return Buffer.from(data);
+                    }},
+                    writeFileSync: (path, data, options) => {{
+                        let bytes;
+                        if (typeof data === 'string') {{
+                            bytes = new TextEncoder().encode(data);
+                        }} else if (data instanceof Uint8Array) {{
+                            bytes = data;
+                        }} else {{
+                            bytes = new Uint8Array(data);
+                        }}
+                        ops.op_fs_write_file_sync(path, bytes);
+                    }},
+                    unlinkSync: (path) => ops.op_fs_unlink_sync(path),
+                    rmdirSync: (path) => ops.op_fs_rmdir_sync(path),
+                    statSync: (path) => createStats(ops.op_fs_stat_sync(path)),
+                    lstatSync: (path) => createStats(ops.op_fs_lstat_sync(path)),
+                    fstatSync: (fd) => {{
+                        // For Emscripten compatibility, return a minimal stat for fd
+                        return createStats({{ is_file: true, is_directory: false, is_symlink: false, size: 0, mode: 0o644, mtime_ms: 0, atime_ms: 0, ctime_ms: 0 }});
+                    }},
+                    readdirSync: (path) => ops.op_fs_readdir_sync(path),
+                    renameSync: (oldPath, newPath) => ops.op_fs_rename_sync(oldPath, newPath),
+                    truncateSync: (path, len = 0) => ops.op_fs_truncate_sync(path, BigInt(len)),
+                    ftruncateSync: (fd, len = 0) => {{}}, // stub for Emscripten
+                    chmodSync: (path, mode) => {{}}, // stub
+                    fchmodSync: (fd, mode) => {{}}, // stub
+                    chownSync: (path, uid, gid) => {{}}, // stub
+                    fchownSync: (fd, uid, gid) => {{}}, // stub
+                    utimesSync: (path, atime, mtime) => {{}}, // stub
+                    openSync: (path, flags, mode) => {{
+                        // Emscripten's NODEFS needs this - return a dummy fd
+                        // The actual file ops go through the path-based functions
+                        return 999;
+                    }},
+                    closeSync: (fd) => {{}}, // stub
+                    readSync: (fd, buffer, offset, length, position) => {{
+                        // stub - Emscripten typically uses path-based ops
+                        return 0;
+                    }},
+                    writeSync: (fd, buffer, offset, length, position) => {{
+                        // stub - Emscripten typically uses path-based ops
+                        return length || buffer.length;
+                    }},
+                    fsyncSync: (fd) => {{}}, // stub
+                    fdatasyncSync: (fd) => {{}}, // stub
+                }};
+            }})();
+
+            // Node.js path module
+            const pathModule = (() => {{
+                const sep = '/';
+                const delimiter = ':';
+
+                function join(...parts) {{
+                    return parts.filter(p => p && p.length > 0).join(sep).replace(/\/+/g, '/');
+                }}
+
+                function normalize(path) {{
+                    if (!path) return '.';
+                    const isAbsolute = path.startsWith('/');
+                    const parts = path.split('/').filter(p => p && p !== '.');
+                    const result = [];
+                    for (const part of parts) {{
+                        if (part === '..') {{
+                            if (result.length > 0 && result[result.length - 1] !== '..') {{
+                                result.pop();
+                            }} else if (!isAbsolute) {{
+                                result.push('..');
+                            }}
+                        }} else {{
+                            result.push(part);
+                        }}
+                    }}
+                    let normalized = result.join('/');
+                    if (isAbsolute) normalized = '/' + normalized;
+                    return normalized || (isAbsolute ? '/' : '.');
+                }}
+
+                function dirname(path) {{
+                    if (!path) return '.';
+                    const lastSlash = path.lastIndexOf('/');
+                    if (lastSlash === -1) return '.';
+                    if (lastSlash === 0) return '/';
+                    return path.slice(0, lastSlash);
+                }}
+
+                function basename(path, ext) {{
+                    if (!path) return '';
+                    let base = path;
+                    const lastSlash = path.lastIndexOf('/');
+                    if (lastSlash !== -1) base = path.slice(lastSlash + 1);
+                    if (ext && base.endsWith(ext)) base = base.slice(0, -ext.length);
+                    return base;
+                }}
+
+                function resolve(...parts) {{
+                    let resolved = '';
+                    for (let i = parts.length - 1; i >= 0 && !resolved.startsWith('/'); i--) {{
+                        const part = parts[i];
+                        if (part && part.length > 0) {{
+                            resolved = resolved ? part + '/' + resolved : part;
+                        }}
+                    }}
+                    return normalize(resolved.startsWith('/') ? resolved : '/' + resolved);
+                }}
+
+                return {{ join, normalize, dirname, basename, resolve, sep, delimiter }};
+            }})();
+
+            // Buffer polyfill for Node.js compatibility
+            if (typeof Buffer === 'undefined') {{
+                globalThis.Buffer = class Buffer extends Uint8Array {{
+                    static from(data, encoding) {{
+                        if (typeof data === 'string') {{
+                            return new Buffer(new TextEncoder().encode(data));
+                        }}
+                        if (data instanceof ArrayBuffer) {{
+                            return new Buffer(new Uint8Array(data));
+                        }}
+                        return new Buffer(data);
+                    }}
+                    static alloc(size, fill = 0) {{
+                        const buf = new Buffer(size);
+                        buf.fill(fill);
+                        return buf;
+                    }}
+                    static allocUnsafe(size) {{
+                        return new Buffer(size);
+                    }}
+                    static isBuffer(obj) {{
+                        return obj instanceof Buffer;
+                    }}
+                    toString(encoding) {{
+                        return new TextDecoder().decode(this);
+                    }}
+                }};
+            }}
+
+            // Make fs and path available globally
+            globalThis.fs = fsModule;
+            globalThis.path = pathModule;
+
+            // CommonJS require for Emscripten compatibility
+            globalThis.require = (moduleName) => {{
+                if (moduleName === 'fs' || moduleName === 'node:fs') return fsModule;
+                if (moduleName === 'path' || moduleName === 'node:path') return pathModule;
+                throw new Error('Module not found: ' + moduleName);
+            }};
+
+            // Also provide module/exports for CommonJS compatibility
+            globalThis.module = {{ exports: {{}} }};
+            globalThis.exports = globalThis.module.exports;
+
             globalThis.__pgliteDataDir = "{}";
 
             globalThis.__pgliteReadFile = (path) => {{
