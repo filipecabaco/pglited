@@ -257,6 +257,138 @@ export default {
 };
 "#;
 
+// Node.js path module shim
+const PATH_MODULE_CODE: &str = r#"
+// Node.js path module compatibility shim for PGlite
+const sep = '/';
+const delimiter = ':';
+
+export function join(...parts) {
+    return parts
+        .filter(p => p && p.length > 0)
+        .join(sep)
+        .replace(/\/+/g, '/');
+}
+
+export function resolve(...parts) {
+    let resolved = '';
+    for (let i = parts.length - 1; i >= 0 && !resolved.startsWith('/'); i--) {
+        const part = parts[i];
+        if (part && part.length > 0) {
+            resolved = resolved ? part + '/' + resolved : part;
+        }
+    }
+    // Normalize
+    return normalize(resolved.startsWith('/') ? resolved : '/' + resolved);
+}
+
+export function normalize(path) {
+    if (!path) return '.';
+    const isAbsolute = path.startsWith('/');
+    const parts = path.split('/').filter(p => p && p !== '.');
+    const result = [];
+    for (const part of parts) {
+        if (part === '..') {
+            if (result.length > 0 && result[result.length - 1] !== '..') {
+                result.pop();
+            } else if (!isAbsolute) {
+                result.push('..');
+            }
+        } else {
+            result.push(part);
+        }
+    }
+    let normalized = result.join('/');
+    if (isAbsolute) normalized = '/' + normalized;
+    return normalized || (isAbsolute ? '/' : '.');
+}
+
+export function dirname(path) {
+    if (!path) return '.';
+    const lastSlash = path.lastIndexOf('/');
+    if (lastSlash === -1) return '.';
+    if (lastSlash === 0) return '/';
+    return path.slice(0, lastSlash);
+}
+
+export function basename(path, ext) {
+    if (!path) return '';
+    let base = path;
+    const lastSlash = path.lastIndexOf('/');
+    if (lastSlash !== -1) {
+        base = path.slice(lastSlash + 1);
+    }
+    if (ext && base.endsWith(ext)) {
+        base = base.slice(0, -ext.length);
+    }
+    return base;
+}
+
+export function extname(path) {
+    if (!path) return '';
+    const base = basename(path);
+    const lastDot = base.lastIndexOf('.');
+    if (lastDot <= 0) return '';
+    return base.slice(lastDot);
+}
+
+export function isAbsolute(path) {
+    return path && path.startsWith('/');
+}
+
+export function relative(from, to) {
+    from = resolve(from);
+    to = resolve(to);
+    if (from === to) return '';
+
+    const fromParts = from.split('/').filter(Boolean);
+    const toParts = to.split('/').filter(Boolean);
+
+    let commonLength = 0;
+    for (let i = 0; i < Math.min(fromParts.length, toParts.length); i++) {
+        if (fromParts[i] !== toParts[i]) break;
+        commonLength++;
+    }
+
+    const upCount = fromParts.length - commonLength;
+    const remainingTo = toParts.slice(commonLength);
+
+    return [...Array(upCount).fill('..'), ...remainingTo].join('/') || '.';
+}
+
+export function parse(path) {
+    const root = isAbsolute(path) ? '/' : '';
+    const dir = dirname(path);
+    const base = basename(path);
+    const ext = extname(path);
+    const name = base.slice(0, base.length - ext.length);
+    return { root, dir, base, ext, name };
+}
+
+export function format(pathObject) {
+    const dir = pathObject.dir || pathObject.root || '';
+    const base = pathObject.base || (pathObject.name || '') + (pathObject.ext || '');
+    return dir ? (dir === '/' ? dir + base : dir + '/' + base) : base;
+}
+
+export { sep, delimiter };
+
+export default {
+    join,
+    resolve,
+    normalize,
+    dirname,
+    basename,
+    extname,
+    isAbsolute,
+    relative,
+    parse,
+    format,
+    sep,
+    delimiter,
+};
+"#;
+
 impl ModuleLoader for EmbeddedModuleLoader {
     fn resolve(
         &self,
@@ -267,6 +399,12 @@ impl ModuleLoader for EmbeddedModuleLoader {
         // Handle Node.js fs module
         if specifier == "fs" || specifier == "node:fs" {
             return ModuleSpecifier::parse("pglite:///fs").map_err(|e| module_error(e.to_string()));
+        }
+
+        // Handle Node.js path module
+        if specifier == "path" || specifier == "node:path" {
+            return ModuleSpecifier::parse("pglite:///path")
+                .map_err(|e| module_error(e.to_string()));
         }
 
         if specifier.starts_with("pglite:///") || specifier.starts_with("pglite://") {
@@ -306,6 +444,16 @@ impl ModuleLoader for EmbeddedModuleLoader {
             return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
                 ModuleType::JavaScript,
                 ModuleSourceCode::String(FastString::from(FS_MODULE_CODE.to_string())),
+                &specifier,
+                None,
+            )));
+        }
+
+        // Serve our path module shim
+        if asset_path == "path" {
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(FastString::from(PATH_MODULE_CODE.to_string())),
                 &specifier,
                 None,
             )));
