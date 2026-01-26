@@ -897,11 +897,9 @@ fn normalize_data_dir(data_dir: &str) -> String {
         "memory://".to_string()
     } else if data_dir.starts_with("memory://") || data_dir.starts_with("file://") {
         data_dir.to_string()
-    } else if data_dir.starts_with('/') {
-        // Absolute filesystem path - use file:// for persistent storage
-        format!("file://{}", data_dir)
     } else {
         // Named in-memory database
+        // Note: file:// URLs require Node.js fs module which isn't currently supported
         format!("memory://{}", data_dir)
     }
 }
