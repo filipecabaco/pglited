@@ -151,6 +151,112 @@ fn extract_asset_path_from_specifier(specifier: &ModuleSpecifier) -> String {
     path.strip_prefix('/').unwrap_or(path).to_string()
 }
 
+// Node.js fs module shim that uses our Rust ops
+const FS_MODULE_CODE: &str = r#"
+// Node.js fs module compatibility shim for PGlite
+const { ops } = Deno.core;
+
+function createStats(stat) {
+    return {
+        isFile: () => stat.is_file,
+        isDirectory: () => stat.is_directory,
+        isSymbolicLink: () => stat.is_symlink,
+        size: stat.size,
+        mode: stat.mode,
+        mtimeMs: stat.mtime_ms,
+        atimeMs: stat.atime_ms,
+        ctimeMs: stat.ctime_ms,
+        mtime: new Date(stat.mtime_ms),
+        atime: new Date(stat.atime_ms),
+        ctime: new Date(stat.ctime_ms),
+    };
+}
+
+export function existsSync(path) {
+    return ops.op_fs_exists_sync(path);
+}
+
+export function mkdirSync(path, options) {
+    const recursive = options?.recursive ?? false;
+    ops.op_fs_mkdir_sync(path, recursive);
+}
+
+export function readFileSync(path, options) {
+    const data = ops.op_fs_read_file_sync(path);
+    if (options?.encoding === 'utf8' || options?.encoding === 'utf-8') {
+        return new TextDecoder().decode(data);
+    }
+    return data;
+}
+
+export function writeFileSync(path, data, options) {
+    let bytes;
+    if (typeof data === 'string') {
+        bytes = new TextEncoder().encode(data);
+    } else if (data instanceof Uint8Array) {
+        bytes = data;
+    } else {
+        bytes = new Uint8Array(data);
+    }
+    ops.op_fs_write_file_sync(path, bytes);
+}
+
+export function unlinkSync(path) {
+    ops.op_fs_unlink_sync(path);
+}
+
+export function rmdirSync(path) {
+    ops.op_fs_rmdir_sync(path);
+}
+
+export function statSync(path) {
+    const stat = ops.op_fs_stat_sync(path);
+    return createStats(stat);
+}
+
+export function lstatSync(path) {
+    const stat = ops.op_fs_lstat_sync(path);
+    return createStats(stat);
+}
+
+export function readdirSync(path) {
+    return ops.op_fs_readdir_sync(path);
+}
+
+export function renameSync(oldPath, newPath) {
+    ops.op_fs_rename_sync(oldPath, newPath);
+}
+
+export function truncateSync(path, len = 0) {
+    ops.op_fs_truncate_sync(path, len);
+}
+
+export function chmodSync(path, mode) {
+    // chmod is a no-op on Windows, and we don't need it for PGlite
+}
+
+export function utimesSync(path, atime, mtime) {
+    // utimes is not critical for PGlite, stub it
+}
+
+// Default export for CommonJS-style require('fs')
+export default {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    writeFileSync,
+    unlinkSync,
+    rmdirSync,
+    statSync,
+    lstatSync,
+    readdirSync,
+    renameSync,
+    truncateSync,
+    chmodSync,
+    utimesSync,
+};
+"#;
+
 impl ModuleLoader for EmbeddedModuleLoader {
     fn resolve(
         &self,
@@ -158,6 +264,12 @@ impl ModuleLoader for EmbeddedModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
+        // Handle Node.js fs module
+        if specifier == "fs" || specifier == "node:fs" {
+            return ModuleSpecifier::parse("pglite:///fs")
+                .map_err(|e| module_error(e.to_string()));
+        }
+
         if specifier.starts_with("pglite:///") || specifier.starts_with("pglite://") {
             return ModuleSpecifier::parse(specifier).map_err(|e| module_error(e.to_string()));
         }
@@ -189,6 +301,16 @@ impl ModuleLoader for EmbeddedModuleLoader {
     ) -> ModuleLoadResponse {
         let specifier = module_specifier.clone();
         let asset_path = extract_asset_path_from_specifier(&specifier);
+
+        // Serve our fs module shim
+        if asset_path == "fs" {
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(FastString::from(FS_MODULE_CODE.to_string())),
+                &specifier,
+                None,
+            )));
+        }
 
         let data = match get_embedded_asset(&asset_path) {
             Some(d) => d,
@@ -238,7 +360,167 @@ fn op_exec_wire(#[buffer] payload: &[u8]) -> std::result::Result<Vec<u8>, std::i
     Ok(payload.to_vec())
 }
 
-extension!(pglite_ext, ops = [op_read_file, op_exec_wire],);
+// Filesystem ops for Node.js fs module compatibility
+#[deno_core::op2]
+#[buffer]
+fn op_fs_read_file_sync(#[string] path: String) -> std::result::Result<Vec<u8>, std::io::Error> {
+    std::fs::read(&path)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_write_file_sync(
+    #[string] path: String,
+    #[buffer] data: &[u8],
+) -> std::result::Result<(), std::io::Error> {
+    std::fs::write(&path, data)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_mkdir_sync(
+    #[string] path: String,
+    recursive: bool,
+) -> std::result::Result<(), std::io::Error> {
+    if recursive {
+        std::fs::create_dir_all(&path)
+    } else {
+        std::fs::create_dir(&path)
+    }
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_exists_sync(#[string] path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_unlink_sync(#[string] path: String) -> std::result::Result<(), std::io::Error> {
+    std::fs::remove_file(&path)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_rmdir_sync(#[string] path: String) -> std::result::Result<(), std::io::Error> {
+    std::fs::remove_dir(&path)
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_stat_sync(#[string] path: String) -> std::result::Result<FsStat, std::io::Error> {
+    let metadata = std::fs::metadata(&path)?;
+    Ok(FsStat::from_metadata(&metadata))
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_lstat_sync(#[string] path: String) -> std::result::Result<FsStat, std::io::Error> {
+    let metadata = std::fs::symlink_metadata(&path)?;
+    Ok(FsStat::from_metadata(&metadata))
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_readdir_sync(#[string] path: String) -> std::result::Result<Vec<String>, std::io::Error> {
+    let entries = std::fs::read_dir(&path)?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_rename_sync(
+    #[string] old_path: String,
+    #[string] new_path: String,
+) -> std::result::Result<(), std::io::Error> {
+    std::fs::rename(&old_path, &new_path)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_truncate_sync(
+    #[string] path: String,
+    len: u64,
+) -> std::result::Result<(), std::io::Error> {
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.set_len(len)
+}
+
+#[derive(serde::Serialize)]
+struct FsStat {
+    is_file: bool,
+    is_directory: bool,
+    is_symlink: bool,
+    size: u64,
+    mode: u32,
+    mtime_ms: f64,
+    atime_ms: f64,
+    ctime_ms: f64,
+}
+
+impl FsStat {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.mode()
+        };
+        #[cfg(not(unix))]
+        let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+
+        let atime_ms = metadata
+            .accessed()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+
+        let ctime_ms = metadata
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(mtime_ms);
+
+        FsStat {
+            is_file: metadata.is_file(),
+            is_directory: metadata.is_dir(),
+            is_symlink: metadata.file_type().is_symlink(),
+            size: metadata.len(),
+            mode,
+            mtime_ms,
+            atime_ms,
+            ctime_ms,
+        }
+    }
+}
+
+extension!(
+    pglite_ext,
+    ops = [
+        op_read_file,
+        op_exec_wire,
+        op_fs_read_file_sync,
+        op_fs_write_file_sync,
+        op_fs_mkdir_sync,
+        op_fs_exists_sync,
+        op_fs_unlink_sync,
+        op_fs_rmdir_sync,
+        op_fs_stat_sync,
+        op_fs_lstat_sync,
+        op_fs_readdir_sync,
+        op_fs_rename_sync,
+        op_fs_truncate_sync,
+    ],
+);
 
 fn run_js_runtime(
     receiver: mpsc::Receiver<JsRequest>,
@@ -897,9 +1179,11 @@ fn normalize_data_dir(data_dir: &str) -> String {
         "memory://".to_string()
     } else if data_dir.starts_with("memory://") || data_dir.starts_with("file://") {
         data_dir.to_string()
+    } else if data_dir.starts_with('/') {
+        // Absolute filesystem path - use file:// for persistent storage
+        format!("file://{}", data_dir)
     } else {
         // Named in-memory database
-        // Note: file:// URLs require Node.js fs module which isn't currently supported
         format!("memory://{}", data_dir)
     }
 }
