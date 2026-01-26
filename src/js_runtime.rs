@@ -266,8 +266,7 @@ impl ModuleLoader for EmbeddedModuleLoader {
     ) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
         // Handle Node.js fs module
         if specifier == "fs" || specifier == "node:fs" {
-            return ModuleSpecifier::parse("pglite:///fs")
-                .map_err(|e| module_error(e.to_string()));
+            return ModuleSpecifier::parse("pglite:///fs").map_err(|e| module_error(e.to_string()));
         }
 
         if specifier.starts_with("pglite:///") || specifier.starts_with("pglite://") {
@@ -441,7 +440,7 @@ fn op_fs_rename_sync(
 #[deno_core::op2(fast)]
 fn op_fs_truncate_sync(
     #[string] path: String,
-    len: u64,
+    #[bigint] len: u64,
 ) -> std::result::Result<(), std::io::Error> {
     let file = std::fs::OpenOptions::new().write(true).open(&path)?;
     file.set_len(len)

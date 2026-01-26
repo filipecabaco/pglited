@@ -261,8 +261,7 @@ async fn test_postgres_client_connectivity() {
     let tcp_port = 55400 + (std::process::id() % 100) as u16;
 
     // Start instance
-    let mut instance =
-        TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
+    let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
     instance
         .wait_for_ready(120)
         .expect("Instance failed to become ready");
