@@ -5,6 +5,7 @@ use deno_core::{
     ResolutionKind, RuntimeOptions,
 };
 use deno_error::JsErrorBox;
+use regex::Regex;
 use rust_embed::Embed;
 use serde::de::DeserializeOwned;
 use std::rc::Rc;
@@ -483,21 +484,35 @@ impl ModuleLoader for EmbeddedModuleLoader {
         // The bundled code uses its own require() that doesn't see our global require
         // We do direct text replacement to ensure the modules are accessed from globalThis
         let code = if asset_path == "index.js" {
-            // Replace require("fs") and require('fs') with globalThis.fs
-            // Also replace require("path") and require('path') with globalThis.path
+            // Use regex to match various forms of require for fs and path
+            // This handles minified code where spacing may vary
             let mut patched = code.clone();
 
-            // Replace various forms of require for fs
-            patched = patched.replace(r#"require("fs")"#, "globalThis.fs");
-            patched = patched.replace(r#"require('fs')"#, "globalThis.fs");
-            patched = patched.replace(r#"require("node:fs")"#, "globalThis.fs");
-            patched = patched.replace(r#"require('node:fs')"#, "globalThis.fs");
+            // Match require("fs"), require('fs'), require( "fs" ), etc.
+            // Also handles node:fs variants
+            let fs_regex = Regex::new(r#"require\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap();
+            patched = fs_regex.replace_all(&patched, "globalThis.fs").to_string();
 
-            // Replace various forms of require for path
-            patched = patched.replace(r#"require("path")"#, "globalThis.path");
-            patched = patched.replace(r#"require('path')"#, "globalThis.path");
-            patched = patched.replace(r#"require("node:path")"#, "globalThis.path");
-            patched = patched.replace(r#"require('node:path')"#, "globalThis.path");
+            // Match require("path"), require('path'), etc.
+            let path_regex = Regex::new(r#"require\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap();
+            patched = path_regex
+                .replace_all(&patched, "globalThis.path")
+                .to_string();
+
+            // Also handle the case where a function is aliased and called with fs/path
+            // e.g., n("fs") where n is a renamed require
+            // Look for patterns like: =n("fs") or (n("fs") or ,n("fs")
+            let aliased_fs_regex =
+                Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap();
+            patched = aliased_fs_regex
+                .replace_all(&patched, "${1}globalThis.fs")
+                .to_string();
+
+            let aliased_path_regex =
+                Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap();
+            patched = aliased_path_regex
+                .replace_all(&patched, "${1}globalThis.path")
+                .to_string();
 
             // Also ensure process is available
             let process_injection = r#"
