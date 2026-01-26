@@ -26,6 +26,7 @@ serde_json = "1.0"
 tokio = { version = "1.40", features = ["full", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
+tokio-postgres = "0.7"
 
 [build-dependencies]
 ureq = "2.9"

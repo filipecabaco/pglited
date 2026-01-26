@@ -230,3 +230,160 @@ fn test_ready_signal_format() {
 
     assert!(found_ready, "Ready signal should be found in stdout");
 }
+
+/// Test that data persists across reconnections when using file storage.
+///
+/// This test:
+/// 1. Starts pglited with a file-based data directory
+/// 2. Connects via tokio-postgres and creates a table with data
+/// 3. Stops the pglited instance
+/// 4. Starts a new pglited instance with the same data directory
+/// 5. Verifies the data is still present
+#[tokio::test]
+async fn test_file_storage_data_persists_on_reconnect() {
+    use tokio_postgres::NoTls;
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("pglite_reconnect_test_{}", std::process::id()));
+
+    // Clean up any previous test data
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    let data_dir = temp_dir.to_str().unwrap().to_string();
+    let tcp_port = 55400 + (std::process::id() % 100) as u16;
+
+    println!("=== Phase 1: Create data in new database ===");
+
+    // Start first instance
+    let mut instance1 =
+        TestInstance::start(&data_dir, tcp_port).expect("Failed to start first instance");
+    instance1
+        .wait_for_ready(120)
+        .expect("First instance failed to become ready");
+
+    println!("First instance ready on port {}", tcp_port);
+
+    // Connect and create data
+    let connection_string = format!("host=127.0.0.1 port={} user=postgres", tcp_port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect to first instance");
+
+    // Spawn connection handler
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Create table and insert test data
+    client
+        .execute(
+            "CREATE TABLE test_persistence (id SERIAL PRIMARY KEY, name TEXT, value INTEGER)",
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
+
+    client
+        .execute(
+            "INSERT INTO test_persistence (name, value) VALUES ('alpha', 100), ('beta', 200), ('gamma', 300)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert data");
+
+    // Verify data was inserted
+    let rows = client
+        .query("SELECT name, value FROM test_persistence ORDER BY id", &[])
+        .await
+        .expect("Failed to query data");
+
+    assert_eq!(rows.len(), 3, "Should have 3 rows after insert");
+    println!("Inserted {} rows successfully", rows.len());
+
+    // Close connection and stop instance
+    drop(client);
+    drop(instance1);
+
+    // Give some time for cleanup
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    println!("=== Phase 2: Reconnect and verify data persistence ===");
+
+    // Start second instance with the same data directory
+    let mut instance2 =
+        TestInstance::start(&data_dir, tcp_port).expect("Failed to start second instance");
+    instance2
+        .wait_for_ready(120)
+        .expect("Second instance failed to become ready");
+
+    println!("Second instance ready on port {}", tcp_port);
+
+    // Connect to second instance
+    let (client2, connection2) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect to second instance");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection2.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify table exists and data persisted
+    let rows = client2
+        .query("SELECT name, value FROM test_persistence ORDER BY id", &[])
+        .await
+        .expect("Failed to query data from second instance - table should exist");
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "Should still have 3 rows after reconnect - data should persist"
+    );
+
+    // Verify actual values
+    let row0_name: &str = rows[0].get("name");
+    let row0_value: i32 = rows[0].get("value");
+    assert_eq!(row0_name, "alpha");
+    assert_eq!(row0_value, 100);
+
+    let row1_name: &str = rows[1].get("name");
+    let row1_value: i32 = rows[1].get("value");
+    assert_eq!(row1_name, "beta");
+    assert_eq!(row1_value, 200);
+
+    let row2_name: &str = rows[2].get("name");
+    let row2_value: i32 = rows[2].get("value");
+    assert_eq!(row2_name, "gamma");
+    assert_eq!(row2_value, 300);
+
+    println!("All data verified successfully after reconnect!");
+
+    // Can also insert more data to verify the database is fully functional
+    client2
+        .execute(
+            "INSERT INTO test_persistence (name, value) VALUES ('delta', 400)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert additional data after reconnect");
+
+    let final_count: i64 = client2
+        .query_one("SELECT COUNT(*) FROM test_persistence", &[])
+        .await
+        .expect("Failed to count rows")
+        .get(0);
+
+    assert_eq!(final_count, 4, "Should have 4 rows after additional insert");
+    println!("Successfully inserted new data after reconnect");
+
+    // Cleanup
+    drop(client2);
+    drop(instance2);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    println!("=== Test passed: File storage data persists across reconnections ===");
+}
