@@ -5,6 +5,13 @@ const ENOENT = 44;
 const EEXIST = 20;
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
+const debugEnabled = globalThis.__pgliteDebug === true;
+const debugLog = (...args) => {
+    if (debugEnabled) console.log(...args);
+};
+const debugError = (...args) => {
+    if (debugEnabled) console.error(...args);
+};
 
 function joinPath(base, child) {
     if (!base) return child;
@@ -31,15 +38,15 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
         }
 
         async init(pg, emscriptenOptions) {
-            console.log('[RustBackedFilesystem] init called with pg:', pg);
-            console.log('[RustBackedFilesystem] emscriptenOptions:', emscriptenOptions);
+            debugLog('[RustBackedFilesystem] init called with pg:', pg);
+            debugLog('[RustBackedFilesystem] emscriptenOptions:', emscriptenOptions);
             try {
                 const result = await super.init(pg, emscriptenOptions);
-                console.log('[RustBackedFilesystem] super.init completed');
+                debugLog('[RustBackedFilesystem] super.init completed');
                 return result;
             } catch (err) {
-                console.error('[RustBackedFilesystem] init error:', err);
-                if (err && err.stack) console.error('[RustBackedFilesystem] error stack:', err.stack);
+                debugError('[RustBackedFilesystem] init error:', err);
+                if (err && err.stack) debugError('[RustBackedFilesystem] error stack:', err.stack);
                 throw err;
             }
         }
@@ -210,7 +217,7 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
  * @param {object} ops - Deno.core.ops object
  */
 export function extractTar(tarData, dataDir, ops) {
-    console.log('[extractTar] Starting extraction, tarData size:', tarData.length, 'targetDir:', dataDir);
+    debugLog('[extractTar] Starting extraction, tarData size:', tarData.length, 'targetDir:', dataDir);
     let offset = 0;
     let fileCount = 0;
     let dirCount = 0;
@@ -218,11 +225,11 @@ export function extractTar(tarData, dataDir, ops) {
     try {
         while (offset < tarData.length) {
             if (offset + 512 > tarData.length) {
-                console.log('[extractTar] Reached end of tar at offset:', offset);
+                debugLog('[extractTar] Reached end of tar at offset:', offset);
                 break;
             }
             if (tarData[offset] === 0 && tarData[offset + 100] === 0) {
-                console.log('[extractTar] End of tar detected at offset:', offset);
+                debugLog('[extractTar] End of tar detected at offset:', offset);
                 break;
             }
 
@@ -245,7 +252,7 @@ export function extractTar(tarData, dataDir, ops) {
             const fullPath = joinPath(dataDir, name);
 
             if (fileCount < 5 || dirCount < 5) {
-                console.log('[extractTar] File:', name, 'type:', type, 'size:', size, 'fullPath:', fullPath);
+                debugLog('[extractTar] File:', name, 'type:', type, 'size:', size, 'fullPath:', fullPath);
             }
 
             if (type === 5) {
@@ -265,10 +272,10 @@ export function extractTar(tarData, dataDir, ops) {
 
             offset = dataStart + Math.ceil(size / 512) * 512;
         }
-        console.log('[extractTar] Complete. Extracted', dirCount, 'dirs and', fileCount, 'files');
+        debugLog('[extractTar] Complete. Extracted', dirCount, 'dirs and', fileCount, 'files');
     } catch (err) {
-        console.error('[extractTar] Error during extraction:', err);
-        if (err && err.stack) console.error('[extractTar] Stack:', err.stack);
+        debugError('[extractTar] Error during extraction:', err);
+        if (err && err.stack) debugError('[extractTar] Stack:', err.stack);
         throw err;
     }
 }

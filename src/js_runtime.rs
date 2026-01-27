@@ -733,6 +733,7 @@ fn run_js_runtime(
 
         let data_dir_str = normalize_data_dir(data_dir);
 
+        let debug_enabled = cfg!(debug_assertions);
         let bootstrap_code = format!(
             r#"
             // TextEncoder polyfill (UTF-8 only)
@@ -1210,6 +1211,14 @@ fn run_js_runtime(
                 }};
             }}
 
+            globalThis.__pgliteDebug = {debug_enabled};
+            const debugLog = (...args) => {{
+                if (globalThis.__pgliteDebug) console.log(...args);
+            }};
+            const debugError = (...args) => {{
+                if (globalThis.__pgliteDebug) console.error(...args);
+            }};
+
             // Make fs and path available globally
             globalThis.fs = fsModule;
             globalThis.path = pathModule;
@@ -1219,13 +1228,13 @@ fn run_js_runtime(
             globalThis.RustFilesystem = class RustFilesystem {{
                 constructor(dataDir) {{
                     this.dataDir = dataDir;
-                    this.debug = true; // Enable debug logging
+                    this.debug = globalThis.__pgliteDebug === true;
                     const {{ ops }} = Deno.core;
                     this.ops = ops;
-                    console.log('[RustFilesystem] Constructor called with dataDir:', dataDir);
+                    if (this.debug) console.log('[RustFilesystem] Constructor called with dataDir:', dataDir);
                     // Ensure the data directory exists
                     if (!ops.op_fs_exists_sync(dataDir)) {{
-                        console.log('[RustFilesystem] Creating data directory:', dataDir);
+                        if (this.debug) console.log('[RustFilesystem] Creating data directory:', dataDir);
                         ops.op_fs_mkdir_sync(dataDir, true);
                     }}
                 }}
@@ -1356,7 +1365,7 @@ fn run_js_runtime(
                 }}
 
                 async init(pg, emscriptenOptions) {{
-                    console.log('[RustFilesystem] init called');
+                    if (this.debug) console.log('[RustFilesystem] init called');
                     this.pg = pg;
                     return {{ emscriptenOpts: emscriptenOptions }};
                 }}
@@ -1452,6 +1461,7 @@ fn run_js_runtime(
             globalThis.__pgliteInitError = undefined;
             "#,
             data_dir_str.replace('\\', "\\\\").replace('"', "\\\""),
+            debug_enabled = debug_enabled,
         );
 
         runtime
@@ -1490,34 +1500,34 @@ fn run_js_runtime(
                         const {{ ops }} = Deno.core;
                         const dataDir = "{}";
 
-                        console.log('[Init] BaseFilesystem type:', typeof fsBase.BaseFilesystem);
-                        console.log('[Init] dataDir:', dataDir);
+                        debugLog('[Init] BaseFilesystem type:', typeof fsBase.BaseFilesystem);
+                        debugLog('[Init] dataDir:', dataDir);
 
                         if (!ops.op_fs_exists_sync(dataDir)) {{
                             ops.op_fs_mkdir_sync(dataDir, true);
                         }}
 
                         const RustBackedFilesystem = createRustBackedFilesystem(fsBase.BaseFilesystem, ops, dataDir);
-                        console.log('[Init] RustBackedFilesystem class:', typeof RustBackedFilesystem);
+                        debugLog('[Init] RustBackedFilesystem class:', typeof RustBackedFilesystem);
 
                         const customFs = new RustBackedFilesystem();
-                        console.log('[Init] customFs instance:', customFs);
+                        debugLog('[Init] customFs instance:', customFs);
 
                         const pgVersionPath = dataDir + '/PG_VERSION';
                         const dbExists = ops.op_fs_exists_sync(pgVersionPath);
 
                         if (!dbExists) {{
-                            console.log('[Init] Extracting seed tar...');
+                            debugLog('[Init] Extracting seed tar...');
                             try {{
                                 const seedResp = await fetch('pglite:///pgdata_seed.tar');
-                                console.log('[Init] Fetch response ok:', seedResp.ok, 'status:', seedResp.status);
+                                debugLog('[Init] Fetch response ok:', seedResp.ok, 'status:', seedResp.status);
                                 const tarData = new Uint8Array(await seedResp.arrayBuffer());
-                                console.log('[Init] Tar data size:', tarData.length);
+                                debugLog('[Init] Tar data size:', tarData.length);
                                 extractTar(tarData, dataDir, ops);
-                                console.log('[Init] Seed extraction complete');
+                                debugLog('[Init] Seed extraction complete');
                             }} catch (extractErr) {{
-                                console.error('[Init] Seed extraction failed:', extractErr);
-                                if (extractErr && extractErr.stack) console.error('[Init] Extract error stack:', extractErr.stack);
+                                debugError('[Init] Seed extraction failed:', extractErr);
+                                if (extractErr && extractErr.stack) debugError('[Init] Extract error stack:', extractErr.stack);
                                 throw extractErr;
                             }}
                         }}
@@ -1525,10 +1535,10 @@ fn run_js_runtime(
                         const pg = await mod.PGlite.create({{ fs: customFs }});
                         globalThis.__pgliteInstance = pg;
                         globalThis.__pgliteIsReady = true;
-                        console.log('[Init] PGlite initialized successfully');
+                        debugLog('[Init] PGlite initialized successfully');
                     }} catch (err) {{
-                        console.error('[Init] Error:', err);
-                        if (err && err.stack) console.error('[Init] Stack:', err.stack);
+                        debugError('[Init] Error:', err);
+                        if (err && err.stack) debugError('[Init] Stack:', err.stack);
                         globalThis.__pgliteInitError = String(err);
                         throw err;
                     }}
