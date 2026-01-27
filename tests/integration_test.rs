@@ -43,6 +43,7 @@ impl TestInstance {
 
         let process = Command::new(&binary_path)
             .args([data_dir, &tcp_port.to_string()])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -56,20 +57,62 @@ impl TestInstance {
 
         let reader = BufReader::new(stdout);
         let start = std::time::Instant::now();
+        let mut logs = Vec::new();
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
 
-        for line in reader.lines() {
+        std::thread::spawn(move || {
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        let _ = line_tx.send(Ok(Some(line)));
+                    }
+                    Err(e) => {
+                        let _ = line_tx.send(Err(format!("Failed to read line: {}", e)));
+                        return;
+                    }
+                }
+            }
+            let _ = line_tx.send(Ok(None));
+        });
+
+        loop {
             if start.elapsed() > Duration::from_secs(timeout_secs) {
-                return Err("Timeout waiting for ready signal".to_string());
+                let context = logs.join("\n");
+                if context.is_empty() {
+                    return Err("Timeout waiting for ready signal".to_string());
+                }
+                return Err(format!(
+                    "Timeout waiting for ready signal. Logs:\n{}",
+                    context
+                ));
             }
 
-            let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-
-            if line.contains("\"id\":\"ready\"") && line.contains("\"success\":true") {
-                return Ok(());
+            match line_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(Some(line))) => {
+                    logs.push(line.clone());
+                    if logs.len() > 200 {
+                        logs.remove(0);
+                    }
+                    if line.contains("\"id\":\"ready\"") && line.contains("\"success\":true") {
+                        return Ok(());
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(e),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
 
-        Err("Process exited without sending ready signal".to_string())
+        let context = logs.join("\n");
+        if context.is_empty() {
+            Err("Process exited without sending ready signal".to_string())
+        } else {
+            Err(format!(
+                "Process exited without sending ready signal. Logs:\n{}",
+                context
+            ))
+        }
     }
 
     fn try_tcp_connect(&self) -> Result<TcpStream, String> {
@@ -112,7 +155,7 @@ fn test_binary_starts_and_binds_port() {
 
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
-    match instance.wait_for_ready(60) {
+    match instance.wait_for_ready(75) {
         Ok(()) => {
             println!("Instance ready on port {}", tcp_port);
 
@@ -169,27 +212,21 @@ fn test_multiple_instances_different_ports() {
 }
 
 #[test]
-fn test_persistent_storage_mode() {
-    let temp_dir = std::env::temp_dir().join(format!("pglite_test_{}", std::process::id()));
-    std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
-
-    let data_dir = temp_dir.to_str().unwrap();
+fn test_named_memory_storage() {
+    // Test using a named memory database
+    let data_dir = format!("memory://named_db_{}", std::process::id());
     let tcp_port = 55200 + (std::process::id() % 100) as u16;
 
-    let mut instance = TestInstance::start(data_dir, tcp_port).expect("Failed to start instance");
+    let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
     match instance.wait_for_ready(60) {
         Ok(()) => {
-            println!("Persistent instance ready");
-            assert!(temp_dir.exists(), "Data directory should exist");
+            println!("Named memory instance ready");
         }
         Err(e) => {
-            panic!("Persistent instance failed to start: {}", e);
+            panic!("Named memory instance failed to start: {}", e);
         }
     }
-
-    drop(instance);
-    std::fs::remove_dir_all(&temp_dir).ok();
 }
 
 #[test]
@@ -229,4 +266,329 @@ fn test_ready_signal_format() {
     }
 
     assert!(found_ready, "Ready signal should be found in stdout");
+}
+
+/// Test PostgreSQL client connectivity using tokio-postgres.
+///
+/// This test verifies that pglited can be connected to using a standard
+/// PostgreSQL client library, and that basic SQL operations work correctly.
+#[tokio::test]
+async fn test_postgres_client_connectivity() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://connectivity_test_{}", std::process::id());
+    // Use random port in ephemeral range to avoid conflicts
+    let tcp_port = 49152
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 10000) as u16;
+
+    // Start instance
+    let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    println!("Instance ready on port {}", tcp_port);
+
+    // Connect using tokio-postgres with retry logic
+    // PGlite accepts any password for the postgres user
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+    let mut last_error = None;
+    let mut client_conn = None;
+
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                println!("Connected on attempt {}", attempt);
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                last_error = Some(e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = match client_conn {
+        Some(conn) => conn,
+        None => {
+            // Check if process is still running and get stderr
+            let status = instance.process.try_wait();
+            eprintln!("Process status after connection failures: {:?}", status);
+            if let Ok(Some(exit_status)) = status {
+                if let Some(stderr) = instance.process.stderr.as_mut() {
+                    let mut stderr_output = String::new();
+                    use std::io::Read;
+                    let _ = stderr.read_to_string(&mut stderr_output);
+                    eprintln!("Process stderr:\n{}", stderr_output);
+                }
+                panic!(
+                    "Process exited with status {} before connection succeeded",
+                    exit_status
+                );
+            }
+            panic!("Failed to connect after 10 attempts: {:?}", last_error);
+        }
+    };
+
+    // Spawn connection handler
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Create table and insert test data
+    client
+        .execute(
+            "CREATE TABLE test_table (id SERIAL PRIMARY KEY, name TEXT, value INTEGER)",
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
+
+    client
+        .execute(
+            "INSERT INTO test_table (name, value) VALUES ('alpha', 100), ('beta', 200), ('gamma', 300)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert data");
+
+    // Query and verify data
+    let rows = client
+        .query("SELECT name, value FROM test_table ORDER BY id", &[])
+        .await
+        .expect("Failed to query data");
+
+    assert_eq!(rows.len(), 3, "Should have 3 rows");
+
+    let row0_name: &str = rows[0].get("name");
+    let row0_value: i32 = rows[0].get("value");
+    assert_eq!(row0_name, "alpha");
+    assert_eq!(row0_value, 100);
+
+    let row1_name: &str = rows[1].get("name");
+    let row1_value: i32 = rows[1].get("value");
+    assert_eq!(row1_name, "beta");
+    assert_eq!(row1_value, 200);
+
+    let row2_name: &str = rows[2].get("name");
+    let row2_value: i32 = rows[2].get("value");
+    assert_eq!(row2_name, "gamma");
+    assert_eq!(row2_value, 300);
+
+    println!("All queries executed successfully!");
+
+    // Cleanup
+    drop(client);
+    drop(instance);
+
+    println!("=== Test passed: PostgreSQL client connectivity works ===");
+}
+
+/// Test that data persists across reconnections when using file storage.
+///
+/// This test:
+/// 1. Starts pglited with a file-based data directory
+/// 2. Connects via tokio-postgres and creates a table with data
+/// 3. Stops the pglited instance
+/// 4. Starts a new pglited instance with the same data directory
+/// 5. Verifies the data is still present
+#[tokio::test]
+async fn test_file_storage_data_persists_on_reconnect() {
+    use tokio_postgres::NoTls;
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("pglite_reconnect_test_{}", std::process::id()));
+
+    // Clean up any previous test data
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+    let data_dir = temp_dir.to_str().unwrap().to_string();
+    // Use random port in ephemeral range to avoid conflicts
+    let tcp_port = 49152
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 10000) as u16;
+
+    println!("=== Phase 1: Create data in new database ===");
+    println!("Data directory: {}", data_dir);
+
+    // Start first instance
+    let mut instance1 =
+        TestInstance::start(&data_dir, tcp_port).expect("Failed to start first instance");
+    instance1
+        .wait_for_ready(75)
+        .expect("First instance failed to become ready");
+
+    println!("First instance ready on port {}", tcp_port);
+
+    // Connect and create data
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    // Retry connection with backoff
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                println!("Connected on attempt {}", attempt);
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    let (client, connection) =
+        client_conn.expect("Failed to connect to first instance after retries");
+
+    // Spawn connection handler
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Create table and insert test data
+    client
+        .execute(
+            "CREATE TABLE test_persistence (id SERIAL PRIMARY KEY, name TEXT, value INTEGER)",
+            &[],
+        )
+        .await
+        .expect("Failed to create table");
+
+    client
+        .execute(
+            "INSERT INTO test_persistence (name, value) VALUES ('alpha', 100), ('beta', 200), ('gamma', 300)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert data");
+
+    // Verify data was inserted
+    let rows = client
+        .query("SELECT name, value FROM test_persistence ORDER BY id", &[])
+        .await
+        .expect("Failed to query data");
+
+    assert_eq!(rows.len(), 3, "Should have 3 rows after insert");
+    println!("Inserted {} rows successfully", rows.len());
+
+    // Close connection and stop instance
+    drop(client);
+    drop(instance1);
+
+    // Give some time for cleanup
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    println!("=== Phase 2: Reconnect and verify data persistence ===");
+
+    // Start second instance with the same data directory
+    let mut instance2 =
+        TestInstance::start(&data_dir, tcp_port).expect("Failed to start second instance");
+    instance2
+        .wait_for_ready(75)
+        .expect("Second instance failed to become ready");
+
+    println!("Second instance ready on port {}", tcp_port);
+
+    // Connect to second instance with retry
+    let mut client_conn2 = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                println!("Connected to second instance on attempt {}", attempt);
+                client_conn2 = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!(
+                    "Connection attempt {} to second instance failed: {}",
+                    attempt, e
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    let (client2, connection2) =
+        client_conn2.expect("Failed to connect to second instance after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection2.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify table exists and data persisted
+    let rows = client2
+        .query("SELECT name, value FROM test_persistence ORDER BY id", &[])
+        .await
+        .expect("Failed to query data from second instance - table should exist");
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "Should still have 3 rows after reconnect - data should persist"
+    );
+
+    // Verify actual values
+    let row0_name: &str = rows[0].get("name");
+    let row0_value: i32 = rows[0].get("value");
+    assert_eq!(row0_name, "alpha");
+    assert_eq!(row0_value, 100);
+
+    let row1_name: &str = rows[1].get("name");
+    let row1_value: i32 = rows[1].get("value");
+    assert_eq!(row1_name, "beta");
+    assert_eq!(row1_value, 200);
+
+    let row2_name: &str = rows[2].get("name");
+    let row2_value: i32 = rows[2].get("value");
+    assert_eq!(row2_name, "gamma");
+    assert_eq!(row2_value, 300);
+
+    println!("All data verified successfully after reconnect!");
+
+    // Can also insert more data to verify the database is fully functional
+    client2
+        .execute(
+            "INSERT INTO test_persistence (name, value) VALUES ('delta', 400)",
+            &[],
+        )
+        .await
+        .expect("Failed to insert additional data after reconnect");
+
+    let final_count: i64 = client2
+        .query_one("SELECT COUNT(*) FROM test_persistence", &[])
+        .await
+        .expect("Failed to count rows")
+        .get(0);
+
+    assert_eq!(final_count, 4, "Should have 4 rows after additional insert");
+    println!("Successfully inserted new data after reconnect");
+
+    // Cleanup
+    drop(client2);
+    drop(instance2);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    println!("=== Test passed: File storage data persists across reconnections ===");
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -77,10 +77,6 @@ impl AsyncPgliteExecutor {
     pub async fn execute_query(&self, query: Vec<u8>) -> Result<Vec<u8>> {
         self.runtime.process_wire_message_async(query).await
     }
-}
-
-pub fn bind_tcp_socket(port: u16) -> Result<TcpListener> {
-    TcpListener::bind(("127.0.0.1", port)).context(format!("Failed to bind to port {}", port))
 }
 
 const PGLITE_SERVER_VERSION: &str = "17.5";
@@ -401,21 +397,6 @@ mod tests {
 
         assert_eq!(result, data);
         assert!(!flag);
-    }
-
-    #[test]
-    fn bind_tcp_socket_succeeds_on_available_port() {
-        let listener = bind_tcp_socket(0).expect("Should bind to port 0");
-        let addr = listener.local_addr().expect("Should have local address");
-
-        assert!(addr.port() > 0);
-    }
-
-    #[test]
-    fn bind_tcp_socket_fails_on_privileged_port() {
-        let result = bind_tcp_socket(1);
-
-        assert!(result.is_err());
     }
 
     #[test]

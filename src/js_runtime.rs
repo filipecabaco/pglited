@@ -5,13 +5,57 @@ use deno_core::{
     ResolutionKind, RuntimeOptions,
 };
 use deno_error::JsErrorBox;
+use regex::Regex;
 use rust_embed::Embed;
 use serde::de::DeserializeOwned;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+// File descriptor table for managing open files
+thread_local! {
+    static FD_TABLE: RefCell<FdTable> = RefCell::new(FdTable::new());
+}
+
+struct FdTable {
+    next_fd: u32,
+    files: HashMap<u32, File>,
+}
+
+impl FdTable {
+    fn new() -> Self {
+        Self {
+            next_fd: 10, // Start from 10 to avoid confusion with stdin/stdout/stderr
+            files: HashMap::new(),
+        }
+    }
+
+    fn open(&mut self, file: File) -> u32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(fd, file);
+        fd
+    }
+
+    fn close(&mut self, fd: u32) -> std::io::Result<()> {
+        self.files.remove(&fd).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("Invalid fd: {}", fd))
+        })?;
+        Ok(())
+    }
+
+    fn get(&mut self, fd: u32) -> std::io::Result<&mut File> {
+        self.files.get_mut(&fd).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("Invalid fd: {}", fd))
+        })
+    }
+}
 
 use crate::{PgliteConfig, WireProcessor};
 
@@ -23,6 +67,11 @@ use crate::{PgliteConfig, WireProcessor};
 #[include = "*.tar.gz"]
 #[include = "*.tar"]
 struct PgliteAssets;
+
+#[derive(Embed)]
+#[folder = "src/js"]
+#[include = "*.js"]
+struct JsShimAssets;
 
 fn extract_value<T: DeserializeOwned>(
     runtime: &mut JsRuntime,
@@ -136,6 +185,10 @@ fn get_embedded_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
         .map(|f| f.data)
 }
 
+fn get_js_shim_asset(name: &str) -> Option<String> {
+    JsShimAssets::get(name).and_then(|f| std::str::from_utf8(&f.data).ok().map(|s| s.to_string()))
+}
+
 struct EmbeddedModuleLoader;
 
 fn extract_asset_path_from_specifier(specifier: &ModuleSpecifier) -> String {
@@ -158,6 +211,17 @@ impl ModuleLoader for EmbeddedModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
+        // Handle Node.js fs module
+        if specifier == "fs" || specifier == "node:fs" {
+            return ModuleSpecifier::parse("pglite:///fs").map_err(|e| module_error(e.to_string()));
+        }
+
+        // Handle Node.js path module
+        if specifier == "path" || specifier == "node:path" {
+            return ModuleSpecifier::parse("pglite:///path")
+                .map_err(|e| module_error(e.to_string()));
+        }
+
         if specifier.starts_with("pglite:///") || specifier.starts_with("pglite://") {
             return ModuleSpecifier::parse(specifier).map_err(|e| module_error(e.to_string()));
         }
@@ -190,6 +254,42 @@ impl ModuleLoader for EmbeddedModuleLoader {
         let specifier = module_specifier.clone();
         let asset_path = extract_asset_path_from_specifier(&specifier);
 
+        // Serve our fs module shim from external file
+        if asset_path == "fs" {
+            let code =
+                get_js_shim_asset("fs_shim.js").expect("fs_shim.js not found in embedded assets");
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(FastString::from(code)),
+                &specifier,
+                None,
+            )));
+        }
+
+        // Serve our path module shim from external file
+        if asset_path == "path" {
+            let code = get_js_shim_asset("path_shim.js")
+                .expect("path_shim.js not found in embedded assets");
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(FastString::from(code)),
+                &specifier,
+                None,
+            )));
+        }
+
+        // Serve the RustBackedFilesystem module
+        if asset_path == "shims/rust_backed_filesystem.js" {
+            let code = get_js_shim_asset("rust_backed_filesystem.js")
+                .expect("rust_backed_filesystem.js not found in embedded assets");
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(FastString::from(code)),
+                &specifier,
+                None,
+            )));
+        }
+
         let data = match get_embedded_asset(&asset_path) {
             Some(d) => d,
             None => {
@@ -208,6 +308,61 @@ impl ModuleLoader for EmbeddedModuleLoader {
                     asset_path, e
                 ))));
             }
+        };
+
+        // Patch index.js and fs/nodefs.js to inject fs/path modules for Emscripten NODEFS compatibility
+        // The bundled code uses its own require() that doesn't see our global require
+        // We do direct text replacement to ensure the modules are accessed from globalThis
+        let code = if asset_path == "index.js" {
+            // Use regex to match various forms of require for fs and path
+            // This handles minified code where spacing may vary
+            let mut patched = code.clone();
+
+            // Match require("fs"), require('fs'), require( "fs" ), etc.
+            // Also handles node:fs variants
+            let fs_regex = Regex::new(r#"require\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap();
+            patched = fs_regex.replace_all(&patched, "globalThis.fs").to_string();
+
+            // Match require("path"), require('path'), etc.
+            let path_regex = Regex::new(r#"require\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap();
+            patched = path_regex
+                .replace_all(&patched, "globalThis.path")
+                .to_string();
+
+            // Also handle the case where a function is aliased and called with fs/path
+            // e.g., n("fs") where n is a renamed require
+            // Look for patterns like: =n("fs") or (n("fs") or ,n("fs")
+            let aliased_fs_regex =
+                Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap();
+            patched = aliased_fs_regex
+                .replace_all(&patched, "${1}globalThis.fs")
+                .to_string();
+
+            let aliased_path_regex =
+                Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap();
+            patched = aliased_path_regex
+                .replace_all(&patched, "${1}globalThis.path")
+                .to_string();
+
+            // Also ensure process is available
+            let process_injection = r#"
+// Ensure process global exists for Emscripten
+if (typeof process === 'undefined') {
+    globalThis.process = { platform: 'linux', env: {}, binding: function() { return {}; }, cwd: function() { return '/'; } };
+}
+"#;
+            format!("{}\n{}", process_injection, patched)
+        } else if asset_path == "fs/nodefs.js" {
+            // For nodefs.js, prepend the process stub and make fs available via import
+            let injection = r#"
+// Ensure process global exists for Emscripten
+if (typeof process === 'undefined') {
+    globalThis.process = { platform: 'linux', env: {}, binding: function() { return {}; }, cwd: function() { return '/'; } };
+}
+"#;
+            format!("{}\n{}", injection, code)
+        } else {
+            code
         };
 
         ModuleLoadResponse::Sync(Ok(ModuleSource::new(
@@ -238,7 +393,311 @@ fn op_exec_wire(#[buffer] payload: &[u8]) -> std::result::Result<Vec<u8>, std::i
     Ok(payload.to_vec())
 }
 
-extension!(pglite_ext, ops = [op_read_file, op_exec_wire],);
+// Filesystem ops for Node.js fs module compatibility
+#[deno_core::op2]
+#[buffer]
+fn op_fs_read_file_sync(#[string] path: String) -> std::result::Result<Vec<u8>, std::io::Error> {
+    std::fs::read(&path)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_write_file_sync(
+    #[string] path: String,
+    #[buffer] data: &[u8],
+) -> std::result::Result<(), std::io::Error> {
+    std::fs::write(&path, data)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_mkdir_sync(
+    #[string] path: String,
+    recursive: bool,
+) -> std::result::Result<(), std::io::Error> {
+    if recursive {
+        std::fs::create_dir_all(&path)
+    } else {
+        std::fs::create_dir(&path)
+    }
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_exists_sync(#[string] path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_unlink_sync(#[string] path: String) -> std::result::Result<(), std::io::Error> {
+    std::fs::remove_file(&path)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_rmdir_sync(#[string] path: String) -> std::result::Result<(), std::io::Error> {
+    std::fs::remove_dir(&path)
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_stat_sync(#[string] path: String) -> std::result::Result<FsStat, std::io::Error> {
+    let metadata = std::fs::metadata(&path)?;
+    Ok(FsStat::from_metadata(&metadata))
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_lstat_sync(#[string] path: String) -> std::result::Result<FsStat, std::io::Error> {
+    let metadata = std::fs::symlink_metadata(&path)?;
+    Ok(FsStat::from_metadata(&metadata))
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_readdir_sync(#[string] path: String) -> std::result::Result<Vec<String>, std::io::Error> {
+    let entries = std::fs::read_dir(&path)?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_rename_sync(
+    #[string] old_path: String,
+    #[string] new_path: String,
+) -> std::result::Result<(), std::io::Error> {
+    std::fs::rename(&old_path, &new_path)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_truncate_sync(
+    #[string] path: String,
+    #[bigint] len: u64,
+) -> std::result::Result<(), std::io::Error> {
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.set_len(len)
+}
+
+// File descriptor based operations for BaseFilesystem support
+#[deno_core::op2(fast)]
+fn op_fs_open_sync(
+    #[string] path: String,
+    #[string] flags: String,
+    mode: u32,
+) -> std::result::Result<u32, std::io::Error> {
+    let mut opts = std::fs::OpenOptions::new();
+
+    // Parse flags string (Node.js style: 'r', 'r+', 'w', 'w+', 'a', 'a+', etc.)
+    match flags.as_str() {
+        "r" => {
+            opts.read(true);
+        }
+        "r+" | "rs+" => {
+            opts.read(true).write(true);
+        }
+        "w" => {
+            opts.write(true).create(true).truncate(true);
+        }
+        "wx" => {
+            opts.write(true).create_new(true);
+        }
+        "w+" => {
+            opts.read(true).write(true).create(true).truncate(true);
+        }
+        "wx+" => {
+            opts.read(true).write(true).create_new(true);
+        }
+        "a" => {
+            opts.write(true).append(true).create(true);
+        }
+        "ax" => {
+            opts.write(true).append(true).create_new(true);
+        }
+        "a+" => {
+            opts.read(true).write(true).append(true).create(true);
+        }
+        "ax+" => {
+            opts.read(true).write(true).append(true).create_new(true);
+        }
+        _ => {
+            // Default to read
+            opts.read(true);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if mode > 0 {
+            opts.mode(mode);
+        }
+    }
+
+    let file = opts.open(&path)?;
+    let fd = FD_TABLE.with(|table| table.borrow_mut().open(file));
+    Ok(fd)
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_close_sync(fd: u32) -> std::result::Result<(), std::io::Error> {
+    FD_TABLE.with(|table| table.borrow_mut().close(fd))
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_read_fd_sync(
+    fd: u32,
+    #[buffer] buffer: &mut [u8],
+    offset: u32,
+    length: u32,
+    #[bigint] position: i64,
+) -> std::result::Result<u32, std::io::Error> {
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let file = table.get(fd)?;
+
+        // Seek to position if specified (>= 0)
+        if position >= 0 {
+            file.seek(SeekFrom::Start(position as u64))?;
+        }
+
+        let offset = offset as usize;
+        let length = length as usize;
+        let end = std::cmp::min(offset + length, buffer.len());
+
+        let bytes_read = file.read(&mut buffer[offset..end])?;
+        Ok(bytes_read as u32)
+    })
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_write_fd_sync(
+    fd: u32,
+    #[buffer] buffer: &[u8],
+    offset: u32,
+    length: u32,
+    #[bigint] position: i64,
+) -> std::result::Result<u32, std::io::Error> {
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let file = table.get(fd)?;
+
+        // Seek to position if specified (>= 0)
+        if position >= 0 {
+            file.seek(SeekFrom::Start(position as u64))?;
+        }
+
+        let offset = offset as usize;
+        let length = length as usize;
+        let end = std::cmp::min(offset + length, buffer.len());
+
+        let bytes_written = file.write(&buffer[offset..end])?;
+        Ok(bytes_written as u32)
+    })
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_fs_fstat_sync(fd: u32) -> std::result::Result<FsStat, std::io::Error> {
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let file = table.get(fd)?;
+        let metadata = file.metadata()?;
+        Ok(FsStat::from_metadata(&metadata))
+    })
+}
+
+#[deno_core::op2(fast)]
+fn op_fs_fsync_sync(fd: u32) -> std::result::Result<(), std::io::Error> {
+    FD_TABLE.with(|table| {
+        let mut table = table.borrow_mut();
+        let file = table.get(fd)?;
+        file.sync_all()
+    })
+}
+
+#[derive(serde::Serialize)]
+struct FsStat {
+    is_file: bool,
+    is_directory: bool,
+    is_symlink: bool,
+    size: u64,
+    mode: u32,
+    mtime_ms: f64,
+    atime_ms: f64,
+    ctime_ms: f64,
+}
+
+impl FsStat {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.mode()
+        };
+        #[cfg(not(unix))]
+        let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+
+        let atime_ms = metadata
+            .accessed()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+
+        let ctime_ms = metadata
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(mtime_ms);
+
+        FsStat {
+            is_file: metadata.is_file(),
+            is_directory: metadata.is_dir(),
+            is_symlink: metadata.file_type().is_symlink(),
+            size: metadata.len(),
+            mode,
+            mtime_ms,
+            atime_ms,
+            ctime_ms,
+        }
+    }
+}
+
+extension!(
+    pglite_ext,
+    ops = [
+        op_read_file,
+        op_exec_wire,
+        op_fs_read_file_sync,
+        op_fs_write_file_sync,
+        op_fs_mkdir_sync,
+        op_fs_exists_sync,
+        op_fs_unlink_sync,
+        op_fs_rmdir_sync,
+        op_fs_stat_sync,
+        op_fs_lstat_sync,
+        op_fs_readdir_sync,
+        op_fs_rename_sync,
+        op_fs_truncate_sync,
+        // fd-based ops for BaseFilesystem
+        op_fs_open_sync,
+        op_fs_close_sync,
+        op_fs_read_fd_sync,
+        op_fs_write_fd_sync,
+        op_fs_fstat_sync,
+        op_fs_fsync_sync,
+    ],
+);
 
 fn run_js_runtime(
     receiver: mpsc::Receiver<JsRequest>,
@@ -274,6 +733,7 @@ fn run_js_runtime(
 
         let data_dir_str = normalize_data_dir(data_dir);
 
+        let debug_enabled = cfg!(debug_assertions);
         let bootstrap_code = format!(
             r#"
             // TextEncoder polyfill (UTF-8 only)
@@ -567,6 +1027,361 @@ fn run_js_runtime(
                 }};
             }}
 
+            // Node.js fs module for Emscripten NODEFS compatibility
+            const fsModule = (() => {{
+                const {{ ops }} = Deno.core;
+
+                function createStats(stat) {{
+                    return {{
+                        isFile: () => stat.is_file,
+                        isDirectory: () => stat.is_directory,
+                        isSymbolicLink: () => stat.is_symlink,
+                        isBlockDevice: () => false,
+                        isCharacterDevice: () => false,
+                        isFIFO: () => false,
+                        isSocket: () => false,
+                        dev: 0,
+                        ino: 0,
+                        mode: stat.mode,
+                        nlink: 1,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: stat.size,
+                        blksize: 4096,
+                        blocks: Math.ceil(stat.size / 512),
+                        atimeMs: stat.atime_ms,
+                        mtimeMs: stat.mtime_ms,
+                        ctimeMs: stat.ctime_ms,
+                        birthtimeMs: stat.ctime_ms,
+                        atime: new Date(stat.atime_ms),
+                        mtime: new Date(stat.mtime_ms),
+                        ctime: new Date(stat.ctime_ms),
+                        birthtime: new Date(stat.ctime_ms),
+                    }};
+                }}
+
+                return {{
+                    existsSync: (path) => ops.op_fs_exists_sync(path),
+                    mkdirSync: (path, options) => {{
+                        const recursive = options?.recursive ?? false;
+                        ops.op_fs_mkdir_sync(path, recursive);
+                    }},
+                    readFileSync: (path, options) => {{
+                        const data = ops.op_fs_read_file_sync(path);
+                        if (options?.encoding === 'utf8' || options?.encoding === 'utf-8') {{
+                            return new TextDecoder().decode(data);
+                        }}
+                        return Buffer.from(data);
+                    }},
+                    writeFileSync: (path, data, options) => {{
+                        let bytes;
+                        if (typeof data === 'string') {{
+                            bytes = new TextEncoder().encode(data);
+                        }} else if (data instanceof Uint8Array) {{
+                            bytes = data;
+                        }} else {{
+                            bytes = new Uint8Array(data);
+                        }}
+                        ops.op_fs_write_file_sync(path, bytes);
+                    }},
+                    unlinkSync: (path) => ops.op_fs_unlink_sync(path),
+                    rmdirSync: (path) => ops.op_fs_rmdir_sync(path),
+                    statSync: (path) => createStats(ops.op_fs_stat_sync(path)),
+                    lstatSync: (path) => createStats(ops.op_fs_lstat_sync(path)),
+                    fstatSync: (fd) => {{
+                        // For Emscripten compatibility, return a minimal stat for fd
+                        return createStats({{ is_file: true, is_directory: false, is_symlink: false, size: 0, mode: 0o644, mtime_ms: 0, atime_ms: 0, ctime_ms: 0 }});
+                    }},
+                    readdirSync: (path) => ops.op_fs_readdir_sync(path),
+                    renameSync: (oldPath, newPath) => ops.op_fs_rename_sync(oldPath, newPath),
+                    truncateSync: (path, len = 0) => ops.op_fs_truncate_sync(path, BigInt(len)),
+                    ftruncateSync: (fd, len = 0) => {{}}, // stub for Emscripten
+                    chmodSync: (path, mode) => {{}}, // stub
+                    fchmodSync: (fd, mode) => {{}}, // stub
+                    chownSync: (path, uid, gid) => {{}}, // stub
+                    fchownSync: (fd, uid, gid) => {{}}, // stub
+                    utimesSync: (path, atime, mtime) => {{}}, // stub
+                    openSync: (path, flags, mode) => {{
+                        // Emscripten's NODEFS needs this - return a dummy fd
+                        // The actual file ops go through the path-based functions
+                        return 999;
+                    }},
+                    closeSync: (fd) => {{}}, // stub
+                    readSync: (fd, buffer, offset, length, position) => {{
+                        // stub - Emscripten typically uses path-based ops
+                        return 0;
+                    }},
+                    writeSync: (fd, buffer, offset, length, position) => {{
+                        // stub - Emscripten typically uses path-based ops
+                        return length || buffer.length;
+                    }},
+                    fsyncSync: (fd) => {{}}, // stub
+                    fdatasyncSync: (fd) => {{}}, // stub
+                }};
+            }})();
+
+            // Node.js path module
+            const pathModule = (() => {{
+                const sep = '/';
+                const delimiter = ':';
+
+                function join(...parts) {{
+                    return parts.filter(p => p && p.length > 0).join(sep).replace(/\/+/g, '/');
+                }}
+
+                function normalize(path) {{
+                    if (!path) return '.';
+                    const isAbsolute = path.startsWith('/');
+                    const parts = path.split('/').filter(p => p && p !== '.');
+                    const result = [];
+                    for (const part of parts) {{
+                        if (part === '..') {{
+                            if (result.length > 0 && result[result.length - 1] !== '..') {{
+                                result.pop();
+                            }} else if (!isAbsolute) {{
+                                result.push('..');
+                            }}
+                        }} else {{
+                            result.push(part);
+                        }}
+                    }}
+                    let normalized = result.join('/');
+                    if (isAbsolute) normalized = '/' + normalized;
+                    return normalized || (isAbsolute ? '/' : '.');
+                }}
+
+                function dirname(path) {{
+                    if (!path) return '.';
+                    const lastSlash = path.lastIndexOf('/');
+                    if (lastSlash === -1) return '.';
+                    if (lastSlash === 0) return '/';
+                    return path.slice(0, lastSlash);
+                }}
+
+                function basename(path, ext) {{
+                    if (!path) return '';
+                    let base = path;
+                    const lastSlash = path.lastIndexOf('/');
+                    if (lastSlash !== -1) base = path.slice(lastSlash + 1);
+                    if (ext && base.endsWith(ext)) base = base.slice(0, -ext.length);
+                    return base;
+                }}
+
+                function resolve(...parts) {{
+                    let resolved = '';
+                    for (let i = parts.length - 1; i >= 0 && !resolved.startsWith('/'); i--) {{
+                        const part = parts[i];
+                        if (part && part.length > 0) {{
+                            resolved = resolved ? part + '/' + resolved : part;
+                        }}
+                    }}
+                    return normalize(resolved.startsWith('/') ? resolved : '/' + resolved);
+                }}
+
+                return {{ join, normalize, dirname, basename, resolve, sep, delimiter }};
+            }})();
+
+            // Buffer polyfill for Node.js compatibility
+            if (typeof Buffer === 'undefined') {{
+                globalThis.Buffer = class Buffer extends Uint8Array {{
+                    static from(data, encoding) {{
+                        if (typeof data === 'string') {{
+                            return new Buffer(new TextEncoder().encode(data));
+                        }}
+                        if (data instanceof ArrayBuffer) {{
+                            return new Buffer(new Uint8Array(data));
+                        }}
+                        return new Buffer(data);
+                    }}
+                    static alloc(size, fill = 0) {{
+                        const buf = new Buffer(size);
+                        buf.fill(fill);
+                        return buf;
+                    }}
+                    static allocUnsafe(size) {{
+                        return new Buffer(size);
+                    }}
+                    static isBuffer(obj) {{
+                        return obj instanceof Buffer;
+                    }}
+                    toString(encoding) {{
+                        return new TextDecoder().decode(this);
+                    }}
+                }};
+            }}
+
+            globalThis.__pgliteDebug = {debug_enabled};
+            const debugLog = (...args) => {{
+                if (globalThis.__pgliteDebug) console.log(...args);
+            }};
+            const debugError = (...args) => {{
+                if (globalThis.__pgliteDebug) console.error(...args);
+            }};
+
+            // Make fs and path available globally
+            globalThis.fs = fsModule;
+            globalThis.path = pathModule;
+
+            // Custom filesystem class implementing BaseFilesystem interface for PGlite
+            // This provides proper fd-based file operations for file:// storage
+            globalThis.RustFilesystem = class RustFilesystem {{
+                constructor(dataDir) {{
+                    this.dataDir = dataDir;
+                    this.debug = globalThis.__pgliteDebug === true;
+                    const {{ ops }} = Deno.core;
+                    this.ops = ops;
+                    if (this.debug) console.log('[RustFilesystem] Constructor called with dataDir:', dataDir);
+                    // Ensure the data directory exists
+                    if (!ops.op_fs_exists_sync(dataDir)) {{
+                        if (this.debug) console.log('[RustFilesystem] Creating data directory:', dataDir);
+                        ops.op_fs_mkdir_sync(dataDir, true);
+                    }}
+                }}
+
+                // Convert WASM relative path to absolute path
+                _toAbsPath(path) {{
+                    // PGlite's BaseFilesystem receives paths like /tmp/pglite/base/...
+                    // We need to map these to the actual data directory
+                    const PGDATA_PREFIX = '/tmp/pglite/base';
+                    if (path.startsWith(PGDATA_PREFIX)) {{
+                        const result = this.dataDir + path.substring(PGDATA_PREFIX.length);
+                        if (this.debug) console.log('[RustFilesystem] _toAbsPath:', path, '->', result);
+                        return result;
+                    }}
+                    if (this.debug) console.log('[RustFilesystem] _toAbsPath (no prefix):', path);
+                    return path;
+                }}
+
+                chmod(path, mode) {{
+                    // No-op on most systems for our use case
+                }}
+
+                close(fd) {{
+                    this.ops.op_fs_close_sync(fd);
+                }}
+
+                fstat(fd) {{
+                    const stat = this.ops.op_fs_fstat_sync(fd);
+                    return this._toFsStats(stat);
+                }}
+
+                lstat(path) {{
+                    const absPath = this._toAbsPath(path);
+                    const stat = this.ops.op_fs_lstat_sync(absPath);
+                    return this._toFsStats(stat);
+                }}
+
+                mkdir(path, options) {{
+                    const absPath = this._toAbsPath(path);
+                    const recursive = options?.recursive ?? false;
+                    if (this.debug) console.log('[RustFilesystem] mkdir:', absPath, 'recursive:', recursive);
+                    this.ops.op_fs_mkdir_sync(absPath, recursive);
+                }}
+
+                open(path, flags = 'r', mode = 0o644) {{
+                    const absPath = this._toAbsPath(path);
+                    if (this.debug) console.log('[RustFilesystem] open:', absPath, 'flags:', flags);
+                    return this.ops.op_fs_open_sync(absPath, flags, mode);
+                }}
+
+                readdir(path) {{
+                    const absPath = this._toAbsPath(path);
+                    return this.ops.op_fs_readdir_sync(absPath);
+                }}
+
+                read(fd, buffer, offset, length, position) {{
+                    return this.ops.op_fs_read_fd_sync(fd, buffer, offset, length, BigInt(position));
+                }}
+
+                rename(oldPath, newPath) {{
+                    const absOldPath = this._toAbsPath(oldPath);
+                    const absNewPath = this._toAbsPath(newPath);
+                    this.ops.op_fs_rename_sync(absOldPath, absNewPath);
+                }}
+
+                rmdir(path) {{
+                    const absPath = this._toAbsPath(path);
+                    this.ops.op_fs_rmdir_sync(absPath);
+                }}
+
+                truncate(path, len) {{
+                    const absPath = this._toAbsPath(path);
+                    this.ops.op_fs_truncate_sync(absPath, BigInt(len));
+                }}
+
+                unlink(path) {{
+                    const absPath = this._toAbsPath(path);
+                    this.ops.op_fs_unlink_sync(absPath);
+                }}
+
+                utimes(path, atime, mtime) {{
+                    // No-op for now - timestamps not critical for PGlite
+                }}
+
+                writeFile(path, data, options) {{
+                    const absPath = this._toAbsPath(path);
+                    let bytes;
+                    if (typeof data === 'string') {{
+                        bytes = new TextEncoder().encode(data);
+                    }} else if (data instanceof Uint8Array) {{
+                        bytes = data;
+                    }} else {{
+                        bytes = new Uint8Array(data);
+                    }}
+                    this.ops.op_fs_write_file_sync(absPath, bytes);
+                }}
+
+                write(fd, buffer, offset, length, position) {{
+                    return this.ops.op_fs_write_fd_sync(fd, buffer, offset, length, BigInt(position));
+                }}
+
+                _toFsStats(stat) {{
+                    return {{
+                        dev: 0,
+                        ino: 0,
+                        mode: stat.mode,
+                        nlink: 1,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        size: stat.size,
+                        blksize: 4096,
+                        blocks: Math.ceil(stat.size / 512),
+                        atime: stat.atime_ms / 1000,
+                        mtime: stat.mtime_ms / 1000,
+                        ctime: stat.ctime_ms / 1000,
+                    }};
+                }}
+
+                // Required interface methods from Filesystem
+                async syncToFs(relaxedDurability) {{}}
+                async initialSyncFs() {{}}
+                async closeFs() {{}}
+
+                async dumpTar(dbname, compression) {{
+                    // Use the instance's dumpTar if available
+                    throw new Error('dumpTar should be called on PGlite instance');
+                }}
+
+                async init(pg, emscriptenOptions) {{
+                    if (this.debug) console.log('[RustFilesystem] init called');
+                    this.pg = pg;
+                    return {{ emscriptenOpts: emscriptenOptions }};
+                }}
+            }};
+
+            // CommonJS require for Emscripten compatibility
+            globalThis.require = (moduleName) => {{
+                if (moduleName === 'fs' || moduleName === 'node:fs') return fsModule;
+                if (moduleName === 'path' || moduleName === 'node:path') return pathModule;
+                throw new Error('Module not found: ' + moduleName);
+            }};
+
+            // Also provide module/exports for CommonJS compatibility
+            globalThis.module = {{ exports: {{}} }};
+            globalThis.exports = globalThis.module.exports;
+
             globalThis.__pgliteDataDir = "{}";
 
             globalThis.__pgliteReadFile = (path) => {{
@@ -646,6 +1461,7 @@ fn run_js_runtime(
             globalThis.__pgliteInitError = undefined;
             "#,
             data_dir_str.replace('\\', "\\\\").replace('"', "\\\""),
+            debug_enabled = debug_enabled,
         );
 
         runtime
@@ -664,24 +1480,92 @@ fn run_js_runtime(
         runtime.run_event_loop(Default::default()).await?;
         eval_result.await?;
 
-        let init_code = format!(
-            r#"
-            (async () => {{
-                try {{
-                    const mod = await import("pglite:///index.js");
-                    const options = {{ dataDir: "{}" }};
+        // Determine if we should use the custom filesystem
+        let use_custom_fs = data_dir_str.starts_with("file://");
+        let actual_path = if use_custom_fs {
+            data_dir_str.strip_prefix("file://").unwrap_or(&data_dir_str)
+        } else {
+            &data_dir_str
+        };
 
-                    const pg = await mod.PGlite.create(options);
-                    globalThis.__pgliteInstance = pg;
-                    globalThis.__pgliteIsReady = true;
-                }} catch (err) {{
-                    globalThis.__pgliteInitError = String(err);
-                    throw err;
-                }}
-            }})();
-            "#,
-            data_dir_str.replace('\\', "\\\\").replace('"', "\\\"")
-        );
+        let init_code = if use_custom_fs {
+            format!(
+                r#"
+                (async () => {{
+                    try {{
+                        const mod = await import("pglite:///index.js");
+                        const fsBase = await import("pglite:///fs/base.js");
+                        const {{ createRustBackedFilesystem, extractTar }} = await import("pglite:///shims/rust_backed_filesystem.js");
+
+                        const {{ ops }} = Deno.core;
+                        const dataDir = "{}";
+
+                        debugLog('[Init] BaseFilesystem type:', typeof fsBase.BaseFilesystem);
+                        debugLog('[Init] dataDir:', dataDir);
+
+                        if (!ops.op_fs_exists_sync(dataDir)) {{
+                            ops.op_fs_mkdir_sync(dataDir, true);
+                        }}
+
+                        const RustBackedFilesystem = createRustBackedFilesystem(fsBase.BaseFilesystem, ops, dataDir);
+                        debugLog('[Init] RustBackedFilesystem class:', typeof RustBackedFilesystem);
+
+                        const customFs = new RustBackedFilesystem();
+                        debugLog('[Init] customFs instance:', customFs);
+
+                        const pgVersionPath = dataDir + '/PG_VERSION';
+                        const dbExists = ops.op_fs_exists_sync(pgVersionPath);
+
+                        if (!dbExists) {{
+                            debugLog('[Init] Extracting seed tar...');
+                            try {{
+                                const seedResp = await fetch('pglite:///pgdata_seed.tar');
+                                debugLog('[Init] Fetch response ok:', seedResp.ok, 'status:', seedResp.status);
+                                const tarData = new Uint8Array(await seedResp.arrayBuffer());
+                                debugLog('[Init] Tar data size:', tarData.length);
+                                extractTar(tarData, dataDir, ops);
+                                debugLog('[Init] Seed extraction complete');
+                            }} catch (extractErr) {{
+                                debugError('[Init] Seed extraction failed:', extractErr);
+                                if (extractErr && extractErr.stack) debugError('[Init] Extract error stack:', extractErr.stack);
+                                throw extractErr;
+                            }}
+                        }}
+
+                        const pg = await mod.PGlite.create({{ fs: customFs }});
+                        globalThis.__pgliteInstance = pg;
+                        globalThis.__pgliteIsReady = true;
+                        debugLog('[Init] PGlite initialized successfully');
+                    }} catch (err) {{
+                        debugError('[Init] Error:', err);
+                        if (err && err.stack) debugError('[Init] Stack:', err.stack);
+                        globalThis.__pgliteInitError = String(err);
+                        throw err;
+                    }}
+                }})();
+                "#,
+                actual_path.replace('\\', "\\\\").replace('"', "\\\"")
+            )
+        } else {
+            format!(
+                r#"
+                (async () => {{
+                    try {{
+                        const mod = await import("pglite:///index.js");
+                        const options = {{ dataDir: "{}" }};
+
+                        const pg = await mod.PGlite.create(options);
+                        globalThis.__pgliteInstance = pg;
+                        globalThis.__pgliteIsReady = true;
+                    }} catch (err) {{
+                        globalThis.__pgliteInitError = String(err);
+                        throw err;
+                    }}
+                }})();
+                "#,
+                data_dir_str.replace('\\', "\\\\").replace('"', "\\\"")
+            )
+        };
 
         runtime
             .execute_script("<init>", init_code)
@@ -897,7 +1781,11 @@ fn normalize_data_dir(data_dir: &str) -> String {
         "memory://".to_string()
     } else if data_dir.starts_with("memory://") || data_dir.starts_with("file://") {
         data_dir.to_string()
+    } else if data_dir.starts_with('/') {
+        // Absolute filesystem path - use file:// for persistent storage
+        format!("file://{}", data_dir)
     } else {
+        // Named in-memory database
         format!("memory://{}", data_dir)
     }
 }

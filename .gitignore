@@ -7,3 +7,4 @@ Cargo.lock
 # All assets are auto-generated/downloaded by build.rs
 # The library is self-contained with no static assets committed
 assets/
+remotion
