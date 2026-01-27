@@ -229,8 +229,6 @@ fn test_named_memory_storage() {
     }
 }
 
-
-
 #[test]
 fn test_ready_signal_format() {
     let data_dir = format!("memory://test_signal_{}", std::process::id());
@@ -594,5 +592,3 @@ async fn test_file_storage_data_persists_on_reconnect() {
 
     println!("=== Test passed: File storage data persists across reconnections ===");
 }
-
-
