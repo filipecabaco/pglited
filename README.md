@@ -1,8 +1,6 @@
 # pglited
 
-https://github.com/filipecabaco/pglited/assets/4624701/pglited-demo.mp4
-
-<video src="https://github.com/filipecabaco/pglited/assets/4624701/pglited-demo.mp4" width="800" controls></video>
+![pglited demo](pglited-demo.gif)
 
 A self-contained PostgreSQL runtime using V8 and PGlite WebAssembly. Supports both **memory mode** (in-memory database) and **file mode** (persistent storage).
 
