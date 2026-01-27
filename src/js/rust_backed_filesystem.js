@@ -31,7 +31,17 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
         }
 
         async init(pg, emscriptenOptions) {
-            return await super.init(pg, emscriptenOptions);
+            console.log('[RustBackedFilesystem] init called with pg:', pg);
+            console.log('[RustBackedFilesystem] emscriptenOptions:', emscriptenOptions);
+            try {
+                const result = await super.init(pg, emscriptenOptions);
+                console.log('[RustBackedFilesystem] super.init completed');
+                return result;
+            } catch (err) {
+                console.error('[RustBackedFilesystem] init error:', err);
+                if (err && err.stack) console.error('[RustBackedFilesystem] error stack:', err.stack);
+                throw err;
+            }
         }
 
         async initialSyncFs() {

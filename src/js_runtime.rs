@@ -1490,26 +1490,37 @@ fn run_js_runtime(
                         const {{ ops }} = Deno.core;
                         const dataDir = "{}";
 
+                        console.log('[Init] BaseFilesystem type:', typeof fsBase.BaseFilesystem);
+                        console.log('[Init] dataDir:', dataDir);
+
                         if (!ops.op_fs_exists_sync(dataDir)) {{
                             ops.op_fs_mkdir_sync(dataDir, true);
                         }}
 
                         const RustBackedFilesystem = createRustBackedFilesystem(fsBase.BaseFilesystem, ops, dataDir);
+                        console.log('[Init] RustBackedFilesystem class:', typeof RustBackedFilesystem);
+
                         const customFs = new RustBackedFilesystem();
+                        console.log('[Init] customFs instance:', customFs);
+
                         const pgVersionPath = dataDir + '/PG_VERSION';
                         const dbExists = ops.op_fs_exists_sync(pgVersionPath);
 
                         if (!dbExists) {{
+                            console.log('[Init] Extracting seed tar...');
                             const seedResp = await fetch('pglite:///pgdata_seed.tar');
                             const tarData = new Uint8Array(await seedResp.arrayBuffer());
                             extractTar(tarData, dataDir, ops);
+                            console.log('[Init] Seed extraction complete');
                         }}
 
                         const pg = await mod.PGlite.create({{ fs: customFs }});
                         globalThis.__pgliteInstance = pg;
                         globalThis.__pgliteIsReady = true;
+                        console.log('[Init] PGlite initialized successfully');
                     }} catch (err) {{
                         console.error('[Init] Error:', err);
+                        if (err && err.stack) console.error('[Init] Stack:', err.stack);
                         globalThis.__pgliteInitError = String(err);
                         throw err;
                     }}
