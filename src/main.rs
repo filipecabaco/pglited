@@ -1,6 +1,6 @@
 //! PGlite Port - QuickJS PGlite runtime
 //!
-//! Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>]
+//! Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon]
 //!
 //! Arguments:
 //!   data_dir - Directory for PostgreSQL data or memory://
@@ -14,9 +14,12 @@ use once_cell::sync::Lazy;
 use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
 use serde_json::json;
 use std::env;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
+use std::net::TcpListener;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -44,6 +47,7 @@ struct ServeArgs {
     data_dir: String,
     tcp_port: u16,
     multiplexer_mode: Option<String>,
+    daemon: bool,
 }
 
 impl Command {
@@ -70,6 +74,7 @@ impl Command {
             .parse()
             .context("tcp_port must be a valid port number (1-65535)")?;
         let mut multiplexer_mode: Option<String> = None;
+        let mut daemon = false;
 
         let mut i = 3;
         while i < args.len() {
@@ -82,6 +87,10 @@ impl Command {
                         eprintln!("Error: --multiplexer requires a mode argument (e.g., queue)");
                         std::process::exit(1);
                     }
+                }
+                "--daemon" => {
+                    daemon = true;
+                    i += 1;
                 }
                 arg if arg.starts_with("--") => {
                     eprintln!("Unknown argument: {}", arg);
@@ -98,12 +107,13 @@ impl Command {
             data_dir,
             tcp_port,
             multiplexer_mode,
+            daemon,
         }))
     }
 
     fn print_usage(program_name: &str) {
         eprintln!(
-            "Usage: {} <data_dir> <tcp_port> [--multiplexer <mode>]",
+            "Usage: {} <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon]",
             program_name
         );
         eprintln!("       {} --dump-datadir <output_path>", program_name);
@@ -117,6 +127,7 @@ impl Command {
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --multiplexer <mode>     - Enable connection multiplexer (mode: queue)");
+        eprintln!("  --daemon                 - Start in background threaded (blocking) mode");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} memory:// 5432", program_name);
@@ -163,9 +174,26 @@ fn setup_signal_handlers() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    setup_signal_handlers();
-
     let command = Command::parse()?;
+
+    if let Command::Serve(ref args) = command {
+        if args.daemon && env::var("PGLITED_DAEMON_CHILD").ok().as_deref() != Some("1") {
+            let exe_path = env::current_exe().context("Failed to resolve current executable")?;
+            let mut child = std::process::Command::new(exe_path);
+            child
+                .args(env::args_os().skip(1))
+                .env("PGLITED_DAEMON_CHILD", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            child.spawn().context("Failed to spawn daemon process")?;
+            return Ok(());
+        }
+    }
+
+    if !matches!(command, Command::Serve(ServeArgs { daemon: true, .. })) {
+        setup_signal_handlers();
+    }
 
     match command {
         Command::DumpDataDir { output_path } => {
@@ -214,10 +242,14 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     if let Some(ref mode) = args.multiplexer_mode {
         debug_log!("Multiplexer Mode: {}", mode);
     }
+    if args.daemon {
+        debug_log!("Daemon Mode: enabled");
+    }
     debug_log!("Process ID: {}", std::process::id());
 
     let tcp_port = args.tcp_port;
     let multiplexer_mode = args.multiplexer_mode.clone();
+    let daemon = args.daemon;
     let config = args.into_config();
 
     debug_log!("\n=== Step 1: Creating Runtime ===");
@@ -258,6 +290,59 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     debug_log!("\n=== Step 3: Binding TCP Socket ===");
     debug_log!("  Binding to 127.0.0.1:{}", tcp_port);
+
+    if daemon {
+        let listener = TcpListener::bind(("127.0.0.1", tcp_port))
+            .context("Failed to bind TCP listener")?;
+        listener
+            .set_nonblocking(true)
+            .context("Failed to configure TCP listener")?;
+        debug_log!("✓ TCP listener bound to 127.0.0.1:{}", tcp_port);
+
+        let ready_json = if let Some(ref mode) = multiplexer_mode {
+            json!({"id": "ready", "success": true, "port": tcp_port, "multiplexer": mode})
+        } else {
+            json!({"id": "ready", "success": true, "port": tcp_port})
+        };
+        println!("{}", ready_json);
+        let _ = std::io::stdout().flush();
+        debug_log!("✓ Ready signal sent");
+
+        debug_log!("\n=== Step 5: Accepting Connections (Threaded) ===");
+
+        loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                debug_log!("[SHUTDOWN] Received shutdown signal, exiting accept loop");
+                break;
+            }
+
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    debug_log!("New connection from {:?}", addr);
+
+                    let runtime_clone: Arc<dyn pglited::WireProcessor> = runtime.clone();
+
+                    thread::spawn(move || {
+                        if let Err(e) = pglited::handle_connection(stream, runtime_clone) {
+                            debug_log!("Connection error from {:?}: {:?}", addr, e);
+                        } else {
+                            debug_log!("Client {:?} disconnected", addr);
+                        }
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    debug_log!("Accept error: {:?}", e);
+                }
+            }
+        }
+
+        drop(runtime);
+        debug_log!("[SHUTDOWN] Clean exit");
+        return Ok(());
+    }
 
     let tokio_listener = tokio::net::TcpListener::bind(("127.0.0.1", tcp_port))
         .await

@@ -1,12 +1,16 @@
 # pglited
 
-A self-contained PostgreSQL runtime using V8 and PGlite WebAssembly.
+https://github.com/filipecabaco/pglited/assets/4624701/pglited-demo.mp4
+
+<video src="https://github.com/filipecabaco/pglited/assets/4624701/pglited-demo.mp4" width="800" controls></video>
+
+A self-contained PostgreSQL runtime using V8 and PGlite WebAssembly. Supports both **memory mode** (in-memory database) and **file mode** (persistent storage).
 
 ## Features
 
 - **Single Binary Distribution**: All assets embedded in the binary - no external files required
 - **V8 JavaScript Runtime**: Uses Deno Core for high-performance JavaScript/WebAssembly execution
-- **Memory Mode**: Run entirely in-memory or with persistent storage
+- **Two Storage Modes**: Memory mode for ephemeral databases, file mode for persistent storage
 - **Protocol Compatible**: Full PostgreSQL wire protocol support
 - **Auto-downloading Assets**: PGlite npm package downloaded and embedded at build time
 
@@ -38,10 +42,44 @@ PGPASSWORD=password psql "host=127.0.0.1 port=5432 user=postgres dbname=template
 postgresql://postgres:password@127.0.0.1:5432/template1
 ```
 
+## Examples
+
+### Memory Mode (In-Memory Database)
+
+```bash
+# Start pglited in memory mode
+./target/release/pglited memory:// 5432 --daemon
+
+# Connect and interact
+PGPASSWORD=password psql "host=127.0.0.1 port=5432 user=postgres dbname=template1 sslmode=disable"
+
+template1=# create table users(id serial, name text);
+CREATE TABLE
+
+template1=# insert into users(name) values('Alice'), ('Bob');
+INSERT 0 2
+
+template1=# select * from users;
+ id | name
+----+-------
+  1 | Alice
+  2 | Bob
+(2 rows)
+```
+
+### File Mode (Persistent Storage)
+
+```bash
+# Start pglited with file persistence
+./target/release/pglited /tmp/mydb 5432 --daemon
+
+# Data persists across restarts
+```
+
 ## Command Line Options
 
 ```bash
-Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>]
+Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon]
        pglited --dump-datadir <output_path>
 
 Commands:
@@ -53,6 +91,20 @@ Arguments:
 
 Options:
   --multiplexer <mode>     Enable connection multiplexer (mode: queue)
+  --daemon                 Start in background threaded (blocking) mode
+
+Examples:
+  # In-memory database
+  ./target/release/pglited memory:// 5432
+
+  # Persistent database
+  ./target/release/pglited /tmp/mydb 5432
+
+  # In-memory database (daemon mode)
+  ./target/release/pglited memory:// 5432 --daemon
+
+  # Persistent database (daemon mode)
+  ./target/release/pglited /tmp/mydb 5432 --daemon
 ```
 
 ## Build Targets

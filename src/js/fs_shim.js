@@ -2,6 +2,8 @@
 // This provides fs operations backed by Rust ops
 
 const { ops } = Deno.core;
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
 
 function createStats(stat) {
     return {
@@ -31,7 +33,7 @@ export function mkdirSync(path, options) {
 export function readFileSync(path, options) {
     const data = ops.op_fs_read_file_sync(path);
     if (options?.encoding === 'utf8' || options?.encoding === 'utf-8') {
-        return new TextDecoder().decode(data);
+        return textDecoder.decode(data);
     }
     return data;
 }
@@ -39,7 +41,7 @@ export function readFileSync(path, options) {
 export function writeFileSync(path, data, options) {
     let bytes;
     if (typeof data === 'string') {
-        bytes = new TextEncoder().encode(data);
+        bytes = textEncoder.encode(data);
     } else if (data instanceof Uint8Array) {
         bytes = data;
     } else {

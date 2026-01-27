@@ -3,21 +3,27 @@ const sep = '/';
 const delimiter = ':';
 
 export function join(...parts) {
-    return parts
+    const joined = parts
         .filter(p => p && p.length > 0)
         .join(sep)
         .replace(/\/+/g, '/');
+    return normalize(joined);
 }
 
 export function resolve(...parts) {
-    let resolved = '';
-    for (let i = parts.length - 1; i >= 0 && !resolved.startsWith('/'); i--) {
+    const resolvedParts = [];
+    let resolvedAbsolute = false;
+
+    for (let i = parts.length - 1; i >= 0 && !resolvedAbsolute; i--) {
         const part = parts[i];
         if (part && part.length > 0) {
-            resolved = resolved ? part + '/' + resolved : part;
+            resolvedParts.unshift(part);
+            resolvedAbsolute = part.startsWith('/');
         }
     }
-    return normalize(resolved.startsWith('/') ? resolved : '/' + resolved);
+
+    const resolved = resolvedParts.join('/');
+    return normalize(resolvedAbsolute ? resolved : '/' + resolved);
 }
 
 export function normalize(path) {

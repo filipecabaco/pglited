@@ -1,13 +1,27 @@
 // RustBackedFilesystem - Custom filesystem extending PGlite's BaseFilesystem
 // This class bridges PGlite's VFS to the host filesystem via Rust ops
 
-/**
- * Creates a RustBackedFilesystem class that extends the given BaseFilesystem.
- * @param {typeof BaseFilesystem} BaseFilesystem - The base class to extend
- * @param {object} ops - Deno.core.ops object with filesystem operations
- * @param {string} dataDir - The data directory path
- * @returns {RustBackedFilesystem} The filesystem class
- */
+const ENOENT = 44;
+const EEXIST = 20;
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+function joinPath(base, child) {
+    if (!base) return child;
+    if (!child) return base;
+    const baseEnds = base.endsWith('/');
+    const childStarts = child.startsWith('/');
+    if (baseEnds && childStarts) return base.slice(0, -1) + child;
+    if (!baseEnds && !childStarts) return base + '/' + child;
+    return base + child;
+}
+
+function makeError(kind, path, code) {
+    const err = new Error(kind + ': ' + path);
+    err.code = code;
+    return err;
+}
+
 export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
     return class RustBackedFilesystem extends BaseFilesystem {
         constructor() {
@@ -34,10 +48,7 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
 
         // Map VFS path to actual filesystem path
         _mapPath(vfsPath) {
-            if (vfsPath.startsWith('/')) {
-                return this._dataDir + vfsPath;
-            }
-            return this._dataDir + '/' + vfsPath;
+            return joinPath(this._dataDir, vfsPath);
         }
 
         chmod(path, mode) {
@@ -55,9 +66,7 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
         lstat(path) {
             const realPath = this._mapPath(path);
             if (!this._ops.op_fs_exists_sync(realPath)) {
-                const err = new Error('ENOENT: ' + realPath);
-                err.code = 44; // Emscripten ENOENT
-                throw err;
+                throw makeError('ENOENT', realPath, ENOENT);
             }
             return this._toFsStats(this._ops.op_fs_lstat_sync(realPath));
         }
@@ -69,15 +78,11 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
                 const parts = realPath.split('/');
                 const parentPath = parts.slice(0, -1).join('/');
                 if (parentPath && !this._ops.op_fs_exists_sync(parentPath)) {
-                    const err = new Error('ENOENT: ' + parentPath);
-                    err.code = 44;
-                    throw err;
+                    throw makeError('ENOENT', parentPath, ENOENT);
                 }
             }
             if (this._ops.op_fs_exists_sync(realPath)) {
-                const err = new Error('EEXIST: ' + realPath);
-                err.code = 20; // Emscripten EEXIST
-                throw err;
+                throw makeError('EEXIST', realPath, EEXIST);
             }
             this._ops.op_fs_mkdir_sync(realPath, recursive);
         }
@@ -90,9 +95,7 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
                 flagStr = 'r+';
             }
             if (flagStr === 'r' && !this._ops.op_fs_exists_sync(realPath)) {
-                const err = new Error('ENOENT: ' + realPath);
-                err.code = 44;
-                throw err;
+                throw makeError('ENOENT', realPath, ENOENT);
             }
             return this._ops.op_fs_open_sync(realPath, flagStr, mode);
         }
@@ -100,15 +103,17 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
         readdir(path) {
             const realPath = this._mapPath(path);
             if (!this._ops.op_fs_exists_sync(realPath)) {
-                const err = new Error('ENOENT: ' + realPath);
-                err.code = 44;
-                throw err;
+                throw makeError('ENOENT', realPath, ENOENT);
             }
             return this._ops.op_fs_readdir_sync(realPath);
         }
 
         read(fd, buffer, offset, length, position) {
             if (length === 0) return 0;
+            if (buffer instanceof Uint8Array) {
+                const view = buffer.subarray(offset, offset + length);
+                return this._ops.op_fs_read_fd_sync(fd, view, 0, length, BigInt(position));
+            }
             const tempBuffer = new Uint8Array(length);
             const bytesRead = this._ops.op_fs_read_fd_sync(fd, tempBuffer, 0, length, BigInt(position));
             if (bytesRead > 0 && buffer?.set) {
@@ -146,7 +151,7 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
             }
             let bytes;
             if (typeof data === 'string') {
-                bytes = new TextEncoder().encode(data);
+                bytes = textEncoder.encode(data);
             } else if (data instanceof Uint8Array) {
                 bytes = data;
             } else if (data?.buffer) {
@@ -205,7 +210,7 @@ export function extractTar(tarData, dataDir, ops) {
         // Extract name (first 100 bytes)
         let nameEnd = 0;
         while (nameEnd < 100 && header[nameEnd] !== 0) nameEnd++;
-        const name = new TextDecoder().decode(header.slice(0, nameEnd));
+        const name = textDecoder.decode(header.slice(0, nameEnd));
         if (!name) break;
 
         // Extract size (octal, bytes 124-135)
@@ -219,7 +224,7 @@ export function extractTar(tarData, dataDir, ops) {
         const type = header[156] - 48;
         const dataStart = offset + 512;
         const data = size > 0 ? tarData.slice(dataStart, dataStart + size) : new Uint8Array(0);
-        const fullPath = dataDir + name;
+        const fullPath = joinPath(dataDir, name);
 
         if (type === 5 && !ops.op_fs_exists_sync(fullPath)) {
             ops.op_fs_mkdir_sync(fullPath, true);
