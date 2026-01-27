@@ -320,10 +320,10 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
                 Ok((stream, addr)) => {
                     debug_log!("New connection from {:?}", addr);
 
-                    let runtime_clone: Arc<dyn pglited::WireProcessor> = runtime.clone();
+                    let runtime = Arc::clone(&runtime);
 
                     thread::spawn(move || {
-                        if let Err(e) = pglited::handle_connection(stream, runtime_clone) {
+                        if let Err(e) = pglited::handle_connection(stream, runtime) {
                             debug_log!("Connection error from {:?}: {:?}", addr, e);
                         } else {
                             debug_log!("Client {:?} disconnected", addr);
@@ -375,19 +375,19 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
             result = tokio_listener.accept() => {
                 match result {
-                    Ok((stream, addr)) => {
-                        debug_log!("New connection from {:?}", addr);
+                Ok((stream, addr)) => {
+                    debug_log!("New connection from {:?}", addr);
 
-                        let executor_clone = Arc::clone(&executor);
+                    let executor = Arc::clone(&executor);
 
-                        tokio::spawn(async move {
-                            if let Err(e) = pglited::handle_connection_async(stream, executor_clone).await {
-                                debug_log!("Connection error from {:?}: {:?}", addr, e);
-                            } else {
-                                debug_log!("Client {:?} disconnected", addr);
-                            }
-                        });
-                    }
+                    tokio::spawn(async move {
+                        if let Err(e) = pglited::handle_connection_async(stream, executor).await {
+                            debug_log!("Connection error from {:?}: {:?}", addr, e);
+                        } else {
+                            debug_log!("Client {:?} disconnected", addr);
+                        }
+                    });
+                }
                     Err(e) => {
                         debug_log!("Accept error: {:?}", e);
                     }
