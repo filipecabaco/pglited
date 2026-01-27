@@ -1508,10 +1508,18 @@ fn run_js_runtime(
 
                         if (!dbExists) {{
                             console.log('[Init] Extracting seed tar...');
-                            const seedResp = await fetch('pglite:///pgdata_seed.tar');
-                            const tarData = new Uint8Array(await seedResp.arrayBuffer());
-                            extractTar(tarData, dataDir, ops);
-                            console.log('[Init] Seed extraction complete');
+                            try {{
+                                const seedResp = await fetch('pglite:///pgdata_seed.tar');
+                                console.log('[Init] Fetch response ok:', seedResp.ok, 'status:', seedResp.status);
+                                const tarData = new Uint8Array(await seedResp.arrayBuffer());
+                                console.log('[Init] Tar data size:', tarData.length);
+                                extractTar(tarData, dataDir, ops);
+                                console.log('[Init] Seed extraction complete');
+                            }} catch (extractErr) {{
+                                console.error('[Init] Seed extraction failed:', extractErr);
+                                if (extractErr && extractErr.stack) console.error('[Init] Extract error stack:', extractErr.stack);
+                                throw extractErr;
+                            }}
                         }}
 
                         const pg = await mod.PGlite.create({{ fs: customFs }});

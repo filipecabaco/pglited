@@ -210,43 +210,65 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
  * @param {object} ops - Deno.core.ops object
  */
 export function extractTar(tarData, dataDir, ops) {
+    console.log('[extractTar] Starting extraction, tarData size:', tarData.length, 'targetDir:', dataDir);
     let offset = 0;
-    while (offset < tarData.length) {
-        // Check for end of tar (two zero blocks)
-        if (tarData[offset] === 0 && tarData[offset + 100] === 0) break;
+    let fileCount = 0;
+    let dirCount = 0;
 
-        const header = tarData.slice(offset, offset + 512);
-
-        // Extract name (first 100 bytes)
-        let nameEnd = 0;
-        while (nameEnd < 100 && header[nameEnd] !== 0) nameEnd++;
-        const name = textDecoder.decode(header.slice(0, nameEnd));
-        if (!name) break;
-
-        // Extract size (octal, bytes 124-135)
-        let sizeStr = '';
-        for (let i = 124; i < 136 && header[i] !== 0 && header[i] !== 32; i++) {
-            sizeStr += String.fromCharCode(header[i]);
-        }
-        const size = parseInt(sizeStr, 8) || 0;
-
-        // Type: 0=file, 5=directory
-        const type = header[156] - 48;
-        const dataStart = offset + 512;
-        const data = size > 0 ? tarData.slice(dataStart, dataStart + size) : new Uint8Array(0);
-        const fullPath = joinPath(dataDir, name);
-
-        if (type === 5 && !ops.op_fs_exists_sync(fullPath)) {
-            ops.op_fs_mkdir_sync(fullPath, true);
-        } else if (type === 0) {
-            const parts = fullPath.split('/');
-            const parentPath = parts.slice(0, -1).join('/');
-            if (parentPath && !ops.op_fs_exists_sync(parentPath)) {
-                ops.op_fs_mkdir_sync(parentPath, true);
+    try {
+        while (offset < tarData.length) {
+            if (offset + 512 > tarData.length) {
+                console.log('[extractTar] Reached end of tar at offset:', offset);
+                break;
             }
-            ops.op_fs_write_file_sync(fullPath, data);
-        }
+            if (tarData[offset] === 0 && tarData[offset + 100] === 0) {
+                console.log('[extractTar] End of tar detected at offset:', offset);
+                break;
+            }
 
-        offset = dataStart + Math.ceil(size / 512) * 512;
+            const header = tarData.slice(offset, offset + 512);
+
+            let nameEnd = 0;
+            while (nameEnd < 100 && header[nameEnd] !== 0) nameEnd++;
+            const name = textDecoder.decode(header.slice(0, nameEnd));
+            if (!name) break;
+
+            let sizeStr = '';
+            for (let i = 124; i < 136 && header[i] !== 0 && header[i] !== 32; i++) {
+                sizeStr += String.fromCharCode(header[i]);
+            }
+            const size = parseInt(sizeStr, 8) || 0;
+
+            const type = header[156] - 48;
+            const dataStart = offset + 512;
+            const data = size > 0 ? tarData.slice(dataStart, dataStart + size) : new Uint8Array(0);
+            const fullPath = joinPath(dataDir, name);
+
+            if (fileCount < 5 || dirCount < 5) {
+                console.log('[extractTar] File:', name, 'type:', type, 'size:', size, 'fullPath:', fullPath);
+            }
+
+            if (type === 5) {
+                if (!ops.op_fs_exists_sync(fullPath)) {
+                    ops.op_fs_mkdir_sync(fullPath, true);
+                    dirCount++;
+                }
+            } else if (type === 0) {
+                const parts = fullPath.split('/');
+                const parentPath = parts.slice(0, -1).join('/');
+                if (parentPath && !ops.op_fs_exists_sync(parentPath)) {
+                    ops.op_fs_mkdir_sync(parentPath, true);
+                }
+                ops.op_fs_write_file_sync(fullPath, data);
+                fileCount++;
+            }
+
+            offset = dataStart + Math.ceil(size / 512) * 512;
+        }
+        console.log('[extractTar] Complete. Extracted', dirCount, 'dirs and', fileCount, 'files');
+    } catch (err) {
+        console.error('[extractTar] Error during extraction:', err);
+        if (err && err.stack) console.error('[extractTar] Stack:', err.stack);
+        throw err;
     }
 }
