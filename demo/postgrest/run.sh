@@ -8,6 +8,36 @@ DATA_DIR="/tmp/pglited_postgrest_demo"
 PG_PORT=54321
 POSTGREST_PORT=3000
 
+shutdown_existing() {
+  echo "Shutting down any existing processes..."
+  
+  if nc -z 127.0.0.1 "$PG_PORT" 2>/dev/null; then
+    echo "Killing process on port $PG_PORT..."
+    lsof -ti:$PG_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+  
+  if nc -z 127.0.0.1 "$POSTGREST_PORT" 2>/dev/null; then
+    echo "Killing process on port $POSTGREST_PORT..."
+    lsof -ti:$POSTGREST_PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+  
+  pkill -f "postgrest" 2>/dev/null || true
+  pkill -f "pglited" 2>/dev/null || true
+  sleep 1
+  
+  if [ -d "$DATA_DIR" ]; then
+    echo "Removing existing data directory $DATA_DIR..."
+    rm -rf "$DATA_DIR" 2>/dev/null || true
+  fi
+  
+  echo "Shutdown complete"
+  echo ""
+}
+
+shutdown_existing
+
 cleanup() {
   echo "Cleaning up..."
   [ -n "${POSTGREST_PID:-}" ] && kill "$POSTGREST_PID" 2>/dev/null || true
@@ -36,7 +66,6 @@ if ! command -v deno &>/dev/null; then
 fi
 
 # --- Start pglited in daemon (file) mode ---
-rm -rf "$DATA_DIR"
 echo "Starting pglited (daemon + file mode → $DATA_DIR, port $PG_PORT)..."
 "$PGLITED" "$DATA_DIR" "$PG_PORT" --daemon &
 PGLITED_PID=$!
