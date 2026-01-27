@@ -292,8 +292,8 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     debug_log!("  Binding to 127.0.0.1:{}", tcp_port);
 
     if daemon {
-        let listener = TcpListener::bind(("127.0.0.1", tcp_port))
-            .context("Failed to bind TCP listener")?;
+        let listener =
+            TcpListener::bind(("127.0.0.1", tcp_port)).context("Failed to bind TCP listener")?;
         listener
             .set_nonblocking(true)
             .context("Failed to configure TCP listener")?;

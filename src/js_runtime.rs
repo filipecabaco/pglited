@@ -186,8 +186,7 @@ fn get_embedded_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
 }
 
 fn get_js_shim_asset(name: &str) -> Option<String> {
-    JsShimAssets::get(name)
-        .and_then(|f| std::str::from_utf8(&f.data).ok().map(|s| s.to_string()))
+    JsShimAssets::get(name).and_then(|f| std::str::from_utf8(&f.data).ok().map(|s| s.to_string()))
 }
 
 struct EmbeddedModuleLoader;
@@ -257,8 +256,8 @@ impl ModuleLoader for EmbeddedModuleLoader {
 
         // Serve our fs module shim from external file
         if asset_path == "fs" {
-            let code = get_js_shim_asset("fs_shim.js")
-                .expect("fs_shim.js not found in embedded assets");
+            let code =
+                get_js_shim_asset("fs_shim.js").expect("fs_shim.js not found in embedded assets");
             return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
                 ModuleType::JavaScript,
                 ModuleSourceCode::String(FastString::from(code)),

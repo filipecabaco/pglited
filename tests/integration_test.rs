@@ -302,10 +302,12 @@ async fn test_postgres_client_connectivity() {
 
     let data_dir = format!("memory://connectivity_test_{}", std::process::id());
     // Use random port in ephemeral range to avoid conflicts
-    let tcp_port = 49152 + (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos() % 10000) as u16;
+    let tcp_port = 49152
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 10000) as u16;
 
     // Start instance
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
@@ -317,7 +319,10 @@ async fn test_postgres_client_connectivity() {
 
     // Connect using tokio-postgres with retry logic
     // PGlite accepts any password for the postgres user
-    let connection_string = format!("host=127.0.0.1 port={} user=postgres password=postgres", tcp_port);
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
     let mut last_error = None;
     let mut client_conn = None;
 
@@ -349,7 +354,10 @@ async fn test_postgres_client_connectivity() {
                     let _ = stderr.read_to_string(&mut stderr_output);
                     eprintln!("Process stderr:\n{}", stderr_output);
                 }
-                panic!("Process exited with status {} before connection succeeded", exit_status);
+                panic!(
+                    "Process exited with status {} before connection succeeded",
+                    exit_status
+                );
             }
             panic!("Failed to connect after 10 attempts: {:?}", last_error);
         }
@@ -432,10 +440,12 @@ async fn test_file_storage_data_persists_on_reconnect() {
 
     let data_dir = temp_dir.to_str().unwrap().to_string();
     // Use random port in ephemeral range to avoid conflicts
-    let tcp_port = 49152 + (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos() % 10000) as u16;
+    let tcp_port = 49152
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 10000) as u16;
 
     println!("=== Phase 1: Create data in new database ===");
     println!("Data directory: {}", data_dir);
@@ -450,7 +460,10 @@ async fn test_file_storage_data_persists_on_reconnect() {
     println!("First instance ready on port {}", tcp_port);
 
     // Connect and create data
-    let connection_string = format!("host=127.0.0.1 port={} user=postgres password=postgres", tcp_port);
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
 
     // Retry connection with backoff
     let mut client_conn = None;
@@ -467,7 +480,8 @@ async fn test_file_storage_data_persists_on_reconnect() {
             }
         }
     }
-    let (client, connection) = client_conn.expect("Failed to connect to first instance after retries");
+    let (client, connection) =
+        client_conn.expect("Failed to connect to first instance after retries");
 
     // Spawn connection handler
     tokio::spawn(async move {
@@ -530,12 +544,16 @@ async fn test_file_storage_data_persists_on_reconnect() {
                 break;
             }
             Err(e) => {
-                println!("Connection attempt {} to second instance failed: {}", attempt, e);
+                println!(
+                    "Connection attempt {} to second instance failed: {}",
+                    attempt, e
+                );
                 tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
             }
         }
     }
-    let (client2, connection2) = client_conn2.expect("Failed to connect to second instance after retries");
+    let (client2, connection2) =
+        client_conn2.expect("Failed to connect to second instance after retries");
 
     tokio::spawn(async move {
         if let Err(e) = connection2.await {
@@ -661,7 +679,9 @@ async fn test_daemon_mode_functionality() {
     assert!(ready_received, "Daemon should send ready signal");
 
     // Parent process should have exited after spawning child
-    let status = daemon_process.wait().expect("Failed to wait for daemon parent");
+    let status = daemon_process
+        .wait()
+        .expect("Failed to wait for daemon parent");
     assert!(status.success(), "Daemon parent should exit successfully");
     println!("Daemon parent exited successfully");
 
@@ -669,7 +689,10 @@ async fn test_daemon_mode_functionality() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Connect to the daemonized instance
-    let connection_string = format!("host=127.0.0.1 port={} user=postgres password=postgres", tcp_port);
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
 
     let mut client_conn = None;
 
@@ -698,7 +721,10 @@ async fn test_daemon_mode_functionality() {
 
     // Execute queries to verify daemon functionality
     client
-        .execute("CREATE TABLE daemon_test (id SERIAL PRIMARY KEY, value TEXT)", &[])
+        .execute(
+            "CREATE TABLE daemon_test (id SERIAL PRIMARY KEY, value TEXT)",
+            &[],
+        )
         .await
         .expect("Failed to create table");
 
