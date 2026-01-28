@@ -172,7 +172,10 @@ echo ""
 
 # ── Step 2: Start pglited (in-memory) ──────────────────────────
 echo "--- Starting pglited (in-memory, port $PG_PORT) ---"
-"$PGLITED" "memory://" "$PG_PORT" --daemon --extensions uuid_ossp,pgcrypto
+# Set search_path to include auth schema for Supabase Auth compatibility
+# Auth queries tables with unqualified names (e.g., "identities" instead of "auth.identities")
+"$PGLITED" "memory://" "$PG_PORT" --daemon --extensions uuid_ossp,pgcrypto \
+  --init-sql "SET search_path TO auth, public, api"
 
 echo "Waiting for pglited..."
 for i in $(seq 1 30); do

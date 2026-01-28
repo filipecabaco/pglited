@@ -105,6 +105,7 @@ pub struct PgliteRuntime {
 enum JsRequest {
     Exec(Vec<u8>, mpsc::Sender<Result<Vec<u8>>>),
     ExecAsync(Vec<u8>, oneshot::Sender<Result<Vec<u8>>>),
+    ExecSql(String, mpsc::Sender<Result<()>>),
     DumpDataDir(mpsc::Sender<Result<Vec<u8>>>),
     Shutdown,
 }
@@ -143,6 +144,16 @@ impl PgliteRuntime {
 
     pub fn init_postgres(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    pub fn execute_sql(&self, sql: &str) -> Result<()> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.sender
+            .send(JsRequest::ExecSql(sql.to_string(), response_tx))
+            .map_err(|_| anyhow::anyhow!("Runtime channel closed"))?;
+        response_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| anyhow::anyhow!("SQL execution timeout"))?
     }
 
     pub fn dump_data_dir(&self) -> Result<Vec<u8>> {
@@ -1804,6 +1815,11 @@ fn run_js_runtime(
                 let result = dump_data_dir_sync(&mut runtime, &tokio_rt, &extensions);
                 let _ = response_tx.send(result);
             }
+            Ok(JsRequest::ExecSql(sql, response_tx)) => {
+                let result = exec_sql(&mut runtime, &sql);
+                let _ = response_tx.send(result);
+                runtime.v8_isolate().perform_microtask_checkpoint();
+            }
             Ok(JsRequest::Shutdown) | Err(_) => break,
         }
     }
@@ -1900,6 +1916,54 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8
         // Fallback to serde deserialization for arrays (legacy path)
         serde_v8::from_v8(scope, result).context("Failed to deserialize V8 value")
     }
+}
+
+fn exec_sql(runtime: &mut JsRuntime, sql: &str) -> Result<()> {
+    // Escape the SQL for JavaScript string
+    let escaped_sql = sql.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
+
+    let code = format!(
+        r#"
+        globalThis.__execSqlError = null;
+        globalThis.__execSqlDone = false;
+        (async () => {{
+            try {{
+                const pg = globalThis.__pgliteInstance;
+                await pg.exec(`{}`);
+                globalThis.__execSqlDone = true;
+            }} catch (e) {{
+                globalThis.__execSqlError = String(e);
+                globalThis.__execSqlDone = true;
+            }}
+        }})();
+        "#,
+        escaped_sql
+    );
+
+    runtime
+        .execute_script("<exec_sql>", code)
+        .context("Failed to start SQL execution")?;
+
+    // Run event loop to completion
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create tokio runtime for exec_sql")?;
+
+    tokio_rt.block_on(async {
+        runtime.run_event_loop(PollEventLoopOptions::default()).await
+    }).context("Failed to run event loop for exec_sql")?;
+
+    // Check for errors
+    let error_global = runtime
+        .execute_script("<check_sql_error>", "globalThis.__execSqlError")
+        .context("Failed to check SQL error")?;
+    let error: Option<String> = extract_value(runtime, error_global)?;
+    if let Some(error) = error {
+        return Err(anyhow::anyhow!("SQL execution failed: {}", error));
+    }
+
+    Ok(())
 }
 
 fn dump_data_dir_sync(

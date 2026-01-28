@@ -49,6 +49,7 @@ struct ServeArgs {
     multiplexer_mode: Option<String>,
     daemon: bool,
     extensions: Vec<String>,
+    init_sql: Option<String>,
 }
 
 impl Command {
@@ -108,6 +109,7 @@ impl Command {
         let mut multiplexer_mode: Option<String> = None;
         let mut daemon = false;
         let mut extensions: Option<Vec<String>> = None;
+        let mut init_sql: Option<String> = None;
 
         let mut i = 3;
         while i < args.len() {
@@ -134,6 +136,15 @@ impl Command {
                         std::process::exit(1);
                     }
                 }
+                "--init-sql" => {
+                    if i + 1 < args.len() {
+                        init_sql = Some(args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        eprintln!("Error: --init-sql requires a SQL statement");
+                        std::process::exit(1);
+                    }
+                }
                 arg if arg.starts_with("--") => {
                     eprintln!("Unknown argument: {}", arg);
                     std::process::exit(1);
@@ -148,12 +159,16 @@ impl Command {
         let env_extensions = env::var("PGLITED_EXTENSIONS").ok();
         let extensions = extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
 
+        let env_init_sql = env::var("PGLITED_INIT_SQL").ok();
+        let init_sql = init_sql.or(env_init_sql);
+
         Ok(Command::Serve(ServeArgs {
             data_dir,
             tcp_port,
             multiplexer_mode,
             daemon,
             extensions: extensions.unwrap_or_default(),
+            init_sql,
         }))
     }
 
@@ -175,10 +190,12 @@ impl Command {
         eprintln!("  --multiplexer <mode>     - Enable connection multiplexer (mode: queue)");
         eprintln!("  --daemon                 - Start in background threaded (blocking) mode");
         eprintln!("  --extensions <list>      - Comma-separated PGlite extensions");
+        eprintln!("  --init-sql <sql>         - SQL to run after PostgreSQL starts");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} memory:// 5432", program_name);
         eprintln!("  {} memory:// 5432 --extensions pg_trgm,vector", program_name);
+        eprintln!("  {} memory:// 5432 --init-sql \"ALTER DATABASE template1 SET search_path TO myschema, public\"", program_name);
         eprintln!("  {} --dump-datadir pgdata_seed.tar.gz", program_name);
         eprintln!(
             "  {} --dump-datadir pgdata_seed.tar.gz --extensions pg_trgm,vector",
@@ -326,11 +343,15 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     if !args.extensions.is_empty() {
         debug_log!("Extensions: {}", args.extensions.join(","));
     }
+    if let Some(ref sql) = args.init_sql {
+        debug_log!("Init SQL: {}", sql);
+    }
     debug_log!("Process ID: {}", std::process::id());
 
     let tcp_port = args.tcp_port;
     let multiplexer_mode = args.multiplexer_mode.clone();
     let daemon = args.daemon;
+    let init_sql = args.init_sql.clone();
     let config = args.into_config();
 
     debug_log!("\n=== Step 1: Creating Runtime ===");
@@ -344,6 +365,18 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         debug_log!("\n=== Step 2: Initializing PostgreSQL ===");
         runtime.init_postgres()?;
         debug_log!("✓ PostgreSQL initialized");
+
+        // Execute init SQL if provided
+        if let Some(ref sql) = init_sql {
+            debug_log!("\n=== Step 2.5: Running Init SQL ===");
+            debug_log!("  SQL: {}", sql);
+            match runtime.execute_sql(sql) {
+                Ok(_) => debug_log!("✓ Init SQL executed successfully"),
+                Err(e) => {
+                    eprintln!("Warning: Init SQL failed: {:?}", e);
+                }
+            }
+        }
 
         Ok(Arc::new(runtime))
     })

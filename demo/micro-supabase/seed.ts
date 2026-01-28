@@ -18,13 +18,12 @@ console.log("Creating extensions...");
 await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
 await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
 
-// Auth schema required by Supabase Auth (migrations run there)
+// Auth schema required by Supabase Auth
 console.log("Creating auth schema...");
 await sql`CREATE SCHEMA IF NOT EXISTS auth`;
 
-// Pre-create types in auth schema that migrations expect but create without namespace prefix
-// This fixes a bug where some migrations use "create type foo" instead of "create type auth.foo"
-// but later migrations try to "alter type auth.foo"
+// Pre-create types in auth schema for Auth migrations
+// Some migrations create types without namespace prefix, then later try to alter auth.type
 console.log("Pre-creating auth types...");
 await sql.unsafe(`
   DO $$ BEGIN
