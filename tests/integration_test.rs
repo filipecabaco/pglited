@@ -668,3 +668,239 @@ async fn test_pg_trgm_extension_loads() {
     println!("pg_trgm show_trgm('hello') = {}", trgms);
     assert!(trgms.contains("hel"), "Expected trigrams to contain 'hel', got {}", trgms);
 }
+
+/// Test that --init-sql sets search_path correctly.
+///
+/// This test verifies that the --init-sql argument can be used to set
+/// PostgreSQL configuration like search_path that affects subsequent queries.
+#[tokio::test]
+async fn test_init_sql_sets_search_path() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://init_sql_search_path_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    // Start instance with --init-sql to set search_path
+    let mut instance = TestInstance::start_with_args(
+        &data_dir,
+        tcp_port,
+        &["--init-sql", "SET search_path TO myschema, public"],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify the search_path was set correctly
+    let row = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .expect("Failed to query search_path");
+
+    let search_path: &str = row.get(0);
+    println!("search_path = {}", search_path);
+    assert!(
+        search_path.contains("myschema"),
+        "Expected search_path to contain 'myschema', got '{}'",
+        search_path
+    );
+
+    println!("=== Test passed: --init-sql sets search_path correctly ===");
+}
+
+/// Test that --init-sql can create a schema.
+///
+/// This test verifies that the --init-sql argument can execute DDL
+/// statements like CREATE SCHEMA before clients connect.
+#[tokio::test]
+async fn test_init_sql_creates_schema() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://init_sql_create_schema_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    // Start instance with --init-sql to create a schema
+    let mut instance = TestInstance::start_with_args(
+        &data_dir,
+        tcp_port,
+        &["--init-sql", "CREATE SCHEMA IF NOT EXISTS test_schema"],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify the schema was created
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'test_schema'",
+            &[],
+        )
+        .await
+        .expect("Failed to query schema");
+
+    let count: i64 = row.get(0);
+    assert_eq!(count, 1, "Expected schema 'test_schema' to exist");
+
+    // Also verify we can create a table in that schema
+    client
+        .execute(
+            "CREATE TABLE test_schema.items (id SERIAL PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .await
+        .expect("Failed to create table in test_schema");
+
+    client
+        .execute(
+            "INSERT INTO test_schema.items (name) VALUES ('test_item')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert into test_schema.items");
+
+    let item_row = client
+        .query_one("SELECT name FROM test_schema.items WHERE id = 1", &[])
+        .await
+        .expect("Failed to query test_schema.items");
+
+    let name: &str = item_row.get(0);
+    assert_eq!(name, "test_item");
+
+    println!("=== Test passed: --init-sql creates schema correctly ===");
+}
+
+/// Test that --init-sql works with multiple SQL statements.
+///
+/// This test verifies that --init-sql can execute multiple SQL statements
+/// separated by semicolons.
+#[tokio::test]
+async fn test_init_sql_multiple_statements() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://init_sql_multi_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    // Start instance with --init-sql containing multiple statements
+    let mut instance = TestInstance::start_with_args(
+        &data_dir,
+        tcp_port,
+        &[
+            "--init-sql",
+            "CREATE SCHEMA IF NOT EXISTS api; SET search_path TO api, public",
+        ],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify the schema was created
+    let schema_row = client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'api'",
+            &[],
+        )
+        .await
+        .expect("Failed to query schema");
+
+    let schema_count: i64 = schema_row.get(0);
+    assert_eq!(schema_count, 1, "Expected schema 'api' to exist");
+
+    // Verify the search_path was set
+    let path_row = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .expect("Failed to query search_path");
+
+    let search_path: &str = path_row.get(0);
+    println!("search_path = {}", search_path);
+    assert!(
+        search_path.contains("api"),
+        "Expected search_path to contain 'api', got '{}'",
+        search_path
+    );
+
+    println!("=== Test passed: --init-sql handles multiple statements ===");
+}

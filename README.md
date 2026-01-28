@@ -77,7 +77,7 @@ template1=# select * from users;
 ## Command Line Options
 
 ```bash
-Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon] [--extensions <list>]
+Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon] [--extensions <list>] [--init-sql <sql>]
        pglited --dump-datadir <output_path> [--extensions <list>]
 
 Commands:
@@ -91,6 +91,7 @@ Options:
   --multiplexer <mode>     Enable connection multiplexer (mode: queue)
   --daemon                 Start in background threaded (blocking) mode
   --extensions <list>      Comma-separated PGlite extensions
+  --init-sql <sql>         SQL to run after PostgreSQL starts (before accepting connections)
 
 Examples:
   # In-memory database
@@ -107,6 +108,15 @@ Examples:
 
   # Load extensions
   ./target/release/pglited memory:// 5432 --extensions pg_trgm,vector
+
+  # Run initialization SQL (e.g., set search_path for schema compatibility)
+  ./target/release/pglited memory:// 5432 --init-sql "SET search_path TO myschema, public"
+
+  # Create a schema on startup
+  ./target/release/pglited memory:// 5432 --init-sql "CREATE SCHEMA IF NOT EXISTS api"
+
+  # Multiple statements (semicolon-separated)
+  ./target/release/pglited memory:// 5432 --init-sql "CREATE SCHEMA api; SET search_path TO api, public"
 
   # Generate a seed with extensions preloaded
   ./target/release/pglited --dump-datadir pgdata_seed.tar --extensions pg_trgm,vector
@@ -195,10 +205,33 @@ The server implements PostgreSQL wire protocol handling:
 - Injects `server_version` parameter on first response
 - Handles ReadyForQuery state tracking
 
+## Extensions
+
+PGlite supports several extensions that can be loaded via `--extensions` or `PGLITED_EXTENSIONS`:
+
+| Extension | Description |
+|-----------|-------------|
+| `pg_trgm` | Trigram matching for similarity search |
+| `vector` | Vector similarity search (pgvector) |
+| `uuid_ossp` | UUID generation functions |
+| `pgcrypto` | Cryptographic functions |
+| `live` | Live queries (PGlite-specific) |
+| `pg_hashids` | Generate short unique IDs |
+| `pg_ivm` | Incremental view maintenance |
+| `pg_uuidv7` | UUIDv7 generation |
+| `pgtap` | Unit testing framework |
+
+Extensions are loaded at startup and can be enabled with:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
 ## Environment Variables
 
 - `PGLITE_DEBUG=1` - Enable verbose debug output
 - `PGLITED_EXTENSIONS=pg_trgm,vector` - Default extensions to load
+- `PGLITED_INIT_SQL="SET search_path TO myschema"` - SQL to run after PostgreSQL starts
 
 ## Testing
 
@@ -215,7 +248,7 @@ Tests cover:
 ### Test Summary
 
 - 20 unit tests in `src/lib.rs`
-- 4 integration tests in `tests/integration_test.rs`
+- 10 integration tests in `tests/integration_test.rs`
 
 ## Asset Structure
 
