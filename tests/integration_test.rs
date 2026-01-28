@@ -13,11 +13,7 @@ impl TestInstance {
         Self::start_with_args(data_dir, tcp_port, &[])
     }
 
-    fn start_with_args(
-        data_dir: &str,
-        tcp_port: u16,
-        extra_args: &[&str],
-    ) -> Result<Self, String> {
+    fn start_with_args(data_dir: &str, tcp_port: u16, extra_args: &[&str]) -> Result<Self, String> {
         let exe_dir =
             std::env::current_exe().map_err(|e| format!("Failed to get current exe: {}", e))?;
 
@@ -605,12 +601,9 @@ async fn test_pg_trgm_extension_loads() {
     let data_dir = format!("memory://extension_test_{}", std::process::id());
     let tcp_port = allocate_port();
 
-    let mut instance = TestInstance::start_with_args(
-        &data_dir,
-        tcp_port,
-        &["--extensions", "pg_trgm"],
-    )
-    .expect("Failed to start instance");
+    let mut instance =
+        TestInstance::start_with_args(&data_dir, tcp_port, &["--extensions", "pg_trgm"])
+            .expect("Failed to start instance");
     instance
         .wait_for_ready(75)
         .expect("Instance failed to become ready");
@@ -634,8 +627,7 @@ async fn test_pg_trgm_extension_loads() {
         }
     }
 
-    let (client, connection) =
-        client_conn.expect("Failed to connect after retries");
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -655,7 +647,11 @@ async fn test_pg_trgm_extension_loads() {
 
     let score: f32 = row.get("score");
     println!("pg_trgm similarity('foo', 'food') = {}", score);
-    assert!(score > 0.0 && score < 1.0, "Expected similarity score to be between 0 and 1, got {}", score);
+    assert!(
+        score > 0.0 && score < 1.0,
+        "Expected similarity score to be between 0 and 1, got {}",
+        score
+    );
 
     // Also test the show_trgm function to verify the extension is fully loaded
     // show_trgm returns an array, so we cast to text for easier checking
@@ -666,7 +662,11 @@ async fn test_pg_trgm_extension_loads() {
 
     let trgms: &str = trgm_row.get("trgms");
     println!("pg_trgm show_trgm('hello') = {}", trgms);
-    assert!(trgms.contains("hel"), "Expected trigrams to contain 'hel', got {}", trgms);
+    assert!(
+        trgms.contains("hel"),
+        "Expected trigrams to contain 'hel', got {}",
+        trgms
+    );
 }
 
 /// Test that --init-sql sets search_path correctly.

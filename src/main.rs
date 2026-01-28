@@ -40,7 +40,10 @@ macro_rules! debug_log {
 
 enum Command {
     Serve(ServeArgs),
-    DumpDataDir { output_path: String, extensions: Vec<String> },
+    DumpDataDir {
+        output_path: String,
+        extensions: Vec<String>,
+    },
 }
 
 struct ServeArgs {
@@ -88,8 +91,7 @@ impl Command {
             }
 
             let env_extensions = env::var("PGLITED_EXTENSIONS").ok();
-            let extensions =
-                extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
+            let extensions = extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
 
             return Ok(Command::DumpDataDir {
                 output_path,
@@ -177,7 +179,10 @@ impl Command {
             "Usage: {} <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon]",
             program_name
         );
-        eprintln!("       {} --dump-datadir <output_path> [--extensions <list>]", program_name);
+        eprintln!(
+            "       {} --dump-datadir <output_path> [--extensions <list>]",
+            program_name
+        );
         eprintln!();
         eprintln!("Commands:");
         eprintln!("  --dump-datadir <path>    - Dump initialized PostgreSQL data directory to a tar.gz file");
@@ -194,7 +199,10 @@ impl Command {
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} memory:// 5432", program_name);
-        eprintln!("  {} memory:// 5432 --extensions pg_trgm,vector", program_name);
+        eprintln!(
+            "  {} memory:// 5432 --extensions pg_trgm,vector",
+            program_name
+        );
         eprintln!("  {} memory:// 5432 --init-sql \"ALTER DATABASE template1 SET search_path TO myschema, public\"", program_name);
         eprintln!("  {} --dump-datadir pgdata_seed.tar.gz", program_name);
         eprintln!(
@@ -211,18 +219,6 @@ fn parse_extensions(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(|item| item.to_string())
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_extensions;
-
-    #[test]
-    fn parse_extensions_trims_and_skips_empty() {
-        let extensions = parse_extensions(" pg_trgm , ,vector, ");
-
-        assert_eq!(extensions, vec!["pg_trgm".to_string(), "vector".to_string()]);
-    }
 }
 
 impl ServeArgs {
@@ -517,4 +513,19 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     drop(runtime);
     debug_log!("[SHUTDOWN] Clean exit");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_extensions;
+
+    #[test]
+    fn parse_extensions_trims_and_skips_empty() {
+        let extensions = parse_extensions(" pg_trgm , ,vector, ");
+
+        assert_eq!(
+            extensions,
+            vec!["pg_trgm".to_string(), "vector".to_string()]
+        );
+    }
 }

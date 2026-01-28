@@ -218,11 +218,10 @@ fn get_embedded_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
     // normalize_asset_path handles all . and .. segments properly
     let normalized = normalize_asset_path(normalized);
 
-    let asset = PgliteAssets::get(&normalized)
-        .or_else(|| {
-            let without_dist = normalized.strip_prefix("dist/").unwrap_or(&normalized);
-            PgliteAssets::get(without_dist)
-        });
+    let asset = PgliteAssets::get(&normalized).or_else(|| {
+        let without_dist = normalized.strip_prefix("dist/").unwrap_or(&normalized);
+        PgliteAssets::get(without_dist)
+    });
 
     if asset.is_none() {
         debug_log(&format!("Embedded asset not found: {}", normalized));
@@ -437,10 +436,10 @@ fn op_read_file(#[string] path: String) -> std::result::Result<Vec<u8>, std::io:
             // Auto-decompress .tar.gz files so PGlite can read them directly
             // (PGlite tries to use DecompressionStream which we don't have)
             if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
-                match decompress_gzip(&vec) {
-                    Ok(decompressed) => return decompressed,
-                    Err(_) => {} // Fall back to returning raw data
+                if let Ok(decompressed) = decompress_gzip(&vec) {
+                    return decompressed;
                 }
+                // Fall back to returning raw data on decompression error
             }
 
             vec
@@ -1825,38 +1824,6 @@ fn run_js_runtime(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{build_extensions_loader_js, normalize_asset_path};
-
-    #[test]
-    fn build_extensions_loader_js_empty() {
-        let code = build_extensions_loader_js(&[]);
-
-        assert!(code.contains("const __pgliteExtensions = undefined"));
-    }
-
-    #[test]
-    fn build_extensions_loader_js_includes_requested() {
-        let code = build_extensions_loader_js(&[
-            "pg_trgm".to_string(),
-            "vector".to_string(),
-        ]);
-
-        assert!(code.contains("\"pg_trgm\""));
-        assert!(code.contains("\"vector\""));
-        assert!(code.contains("pglite:///vector/index.js"));
-        assert!(code.contains("contrib"));
-    }
-
-    #[test]
-    fn normalize_asset_path_resolves_dot_segments() {
-        let path = normalize_asset_path("contrib/../pg_trgm.tar.gz");
-
-        assert_eq!(path, "pg_trgm.tar.gz");
-    }
-}
-
 #[inline]
 fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8>> {
     // Use V8's ArrayBuffer directly - zero-copy since we own the Vec
@@ -1920,7 +1887,10 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8
 
 fn exec_sql(runtime: &mut JsRuntime, sql: &str) -> Result<()> {
     // Escape the SQL for JavaScript string
-    let escaped_sql = sql.replace('\\', "\\\\").replace('`', "\\`").replace('$', "\\$");
+    let escaped_sql = sql
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('$', "\\$");
 
     let code = format!(
         r#"
@@ -1950,9 +1920,13 @@ fn exec_sql(runtime: &mut JsRuntime, sql: &str) -> Result<()> {
         .build()
         .context("Failed to create tokio runtime for exec_sql")?;
 
-    tokio_rt.block_on(async {
-        runtime.run_event_loop(PollEventLoopOptions::default()).await
-    }).context("Failed to run event loop for exec_sql")?;
+    tokio_rt
+        .block_on(async {
+            runtime
+                .run_event_loop(PollEventLoopOptions::default())
+                .await
+        })
+        .context("Failed to run event loop for exec_sql")?;
 
     // Check for errors
     let error_global = runtime
@@ -2075,5 +2049,34 @@ fn normalize_data_dir(data_dir: &str) -> String {
     } else {
         // Named in-memory database
         format!("memory://{}", data_dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_extensions_loader_js, normalize_asset_path};
+
+    #[test]
+    fn build_extensions_loader_js_empty() {
+        let code = build_extensions_loader_js(&[]);
+
+        assert!(code.contains("const __pgliteExtensions = undefined"));
+    }
+
+    #[test]
+    fn build_extensions_loader_js_includes_requested() {
+        let code = build_extensions_loader_js(&["pg_trgm".to_string(), "vector".to_string()]);
+
+        assert!(code.contains("\"pg_trgm\""));
+        assert!(code.contains("\"vector\""));
+        assert!(code.contains("pglite:///vector/index.js"));
+        assert!(code.contains("contrib"));
+    }
+
+    #[test]
+    fn normalize_asset_path_resolves_dot_segments() {
+        let path = normalize_asset_path("contrib/../pg_trgm.tar.gz");
+
+        assert_eq!(path, "pg_trgm.tar.gz");
     }
 }
