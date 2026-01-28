@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -10,6 +10,10 @@ struct TestInstance {
 
 impl TestInstance {
     fn start(data_dir: &str, tcp_port: u16) -> Result<Self, String> {
+        Self::start_with_args(data_dir, tcp_port, &[])
+    }
+
+    fn start_with_args(data_dir: &str, tcp_port: u16, extra_args: &[&str]) -> Result<Self, String> {
         let exe_dir =
             std::env::current_exe().map_err(|e| format!("Failed to get current exe: {}", e))?;
 
@@ -43,6 +47,7 @@ impl TestInstance {
 
         let process = Command::new(&binary_path)
             .args([data_dir, &tcp_port.to_string()])
+            .args(extra_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -126,6 +131,16 @@ impl TestInstance {
     }
 }
 
+fn allocate_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
+    let port = listener
+        .local_addr()
+        .expect("Failed to read local addr")
+        .port();
+    drop(listener);
+    port
+}
+
 impl Drop for TestInstance {
     fn drop(&mut self) {
         let _ = self.process.kill();
@@ -151,7 +166,7 @@ impl Drop for TestInstance {
 #[test]
 fn test_binary_starts_and_binds_port() {
     let data_dir = format!("memory://test_{}", std::process::id());
-    let tcp_port = 55000 + (std::process::id() % 1000) as u16;
+    let tcp_port = allocate_port();
 
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
@@ -176,13 +191,11 @@ fn test_binary_starts_and_binds_port() {
 
 #[test]
 fn test_multiple_instances_different_ports() {
-    let base_port = 55100 + (std::process::id() % 100) as u16;
-
     let mut instances: Vec<TestInstance> = Vec::new();
 
     for i in 0..3 {
         let data_dir = format!("memory://test_multi_{}_{}", std::process::id(), i);
-        let tcp_port = base_port + i;
+        let tcp_port = allocate_port();
 
         match TestInstance::start(&data_dir, tcp_port) {
             Ok(instance) => {
@@ -215,7 +228,7 @@ fn test_multiple_instances_different_ports() {
 fn test_named_memory_storage() {
     // Test using a named memory database
     let data_dir = format!("memory://named_db_{}", std::process::id());
-    let tcp_port = 55200 + (std::process::id() % 100) as u16;
+    let tcp_port = allocate_port();
 
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
@@ -232,7 +245,7 @@ fn test_named_memory_storage() {
 #[test]
 fn test_ready_signal_format() {
     let data_dir = format!("memory://test_signal_{}", std::process::id());
-    let tcp_port = 55300 + (std::process::id() % 100) as u16;
+    let tcp_port = allocate_port();
 
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
 
@@ -277,13 +290,7 @@ async fn test_postgres_client_connectivity() {
     use tokio_postgres::NoTls;
 
     let data_dir = format!("memory://connectivity_test_{}", std::process::id());
-    // Use random port in ephemeral range to avoid conflicts
-    let tcp_port = 49152
-        + (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-            % 10000) as u16;
+    let tcp_port = allocate_port();
 
     // Start instance
     let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
@@ -415,13 +422,7 @@ async fn test_file_storage_data_persists_on_reconnect() {
     std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
     let data_dir = temp_dir.to_str().unwrap().to_string();
-    // Use random port in ephemeral range to avoid conflicts
-    let tcp_port = 49152
-        + (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-            % 10000) as u16;
+    let tcp_port = allocate_port();
 
     println!("=== Phase 1: Create data in new database ===");
     println!("Data directory: {}", data_dir);
@@ -591,4 +592,315 @@ async fn test_file_storage_data_persists_on_reconnect() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     println!("=== Test passed: File storage data persists across reconnections ===");
+}
+
+#[tokio::test]
+async fn test_pg_trgm_extension_loads() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://extension_test_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    let mut instance =
+        TestInstance::start_with_args(&data_dir, tcp_port, &["--extensions", "pg_trgm"])
+            .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    client
+        .execute("CREATE EXTENSION IF NOT EXISTS pg_trgm", &[])
+        .await
+        .expect("Failed to create pg_trgm extension");
+
+    let row = client
+        .query_one("SELECT similarity('foo', 'food') AS score", &[])
+        .await
+        .expect("Failed to query pg_trgm similarity");
+
+    let score: f32 = row.get("score");
+    println!("pg_trgm similarity('foo', 'food') = {}", score);
+    assert!(
+        score > 0.0 && score < 1.0,
+        "Expected similarity score to be between 0 and 1, got {}",
+        score
+    );
+
+    // Also test the show_trgm function to verify the extension is fully loaded
+    // show_trgm returns an array, so we cast to text for easier checking
+    let trgm_row = client
+        .query_one("SELECT show_trgm('hello')::text AS trgms", &[])
+        .await
+        .expect("Failed to query show_trgm");
+
+    let trgms: &str = trgm_row.get("trgms");
+    println!("pg_trgm show_trgm('hello') = {}", trgms);
+    assert!(
+        trgms.contains("hel"),
+        "Expected trigrams to contain 'hel', got {}",
+        trgms
+    );
+}
+
+/// Test that --init-sql sets search_path correctly.
+///
+/// This test verifies that the --init-sql argument can be used to set
+/// PostgreSQL configuration like search_path that affects subsequent queries.
+#[tokio::test]
+async fn test_init_sql_sets_search_path() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://init_sql_search_path_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    // Start instance with --init-sql to set search_path
+    let mut instance = TestInstance::start_with_args(
+        &data_dir,
+        tcp_port,
+        &["--init-sql", "SET search_path TO myschema, public"],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify the search_path was set correctly
+    let row = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .expect("Failed to query search_path");
+
+    let search_path: &str = row.get(0);
+    println!("search_path = {}", search_path);
+    assert!(
+        search_path.contains("myschema"),
+        "Expected search_path to contain 'myschema', got '{}'",
+        search_path
+    );
+
+    println!("=== Test passed: --init-sql sets search_path correctly ===");
+}
+
+/// Test that --init-sql can create a schema.
+///
+/// This test verifies that the --init-sql argument can execute DDL
+/// statements like CREATE SCHEMA before clients connect.
+#[tokio::test]
+async fn test_init_sql_creates_schema() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://init_sql_create_schema_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    // Start instance with --init-sql to create a schema
+    let mut instance = TestInstance::start_with_args(
+        &data_dir,
+        tcp_port,
+        &["--init-sql", "CREATE SCHEMA IF NOT EXISTS test_schema"],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify the schema was created
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'test_schema'",
+            &[],
+        )
+        .await
+        .expect("Failed to query schema");
+
+    let count: i64 = row.get(0);
+    assert_eq!(count, 1, "Expected schema 'test_schema' to exist");
+
+    // Also verify we can create a table in that schema
+    client
+        .execute(
+            "CREATE TABLE test_schema.items (id SERIAL PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .await
+        .expect("Failed to create table in test_schema");
+
+    client
+        .execute(
+            "INSERT INTO test_schema.items (name) VALUES ('test_item')",
+            &[],
+        )
+        .await
+        .expect("Failed to insert into test_schema.items");
+
+    let item_row = client
+        .query_one("SELECT name FROM test_schema.items WHERE id = 1", &[])
+        .await
+        .expect("Failed to query test_schema.items");
+
+    let name: &str = item_row.get(0);
+    assert_eq!(name, "test_item");
+
+    println!("=== Test passed: --init-sql creates schema correctly ===");
+}
+
+/// Test that --init-sql works with multiple SQL statements.
+///
+/// This test verifies that --init-sql can execute multiple SQL statements
+/// separated by semicolons.
+#[tokio::test]
+async fn test_init_sql_multiple_statements() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://init_sql_multi_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    // Start instance with --init-sql containing multiple statements
+    let mut instance = TestInstance::start_with_args(
+        &data_dir,
+        tcp_port,
+        &[
+            "--init-sql",
+            "CREATE SCHEMA IF NOT EXISTS api; SET search_path TO api, public",
+        ],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(e) => {
+                println!("Connection attempt {} failed: {}", attempt, e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify the schema was created
+    let schema_row = client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'api'",
+            &[],
+        )
+        .await
+        .expect("Failed to query schema");
+
+    let schema_count: i64 = schema_row.get(0);
+    assert_eq!(schema_count, 1, "Expected schema 'api' to exist");
+
+    // Verify the search_path was set
+    let path_row = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .expect("Failed to query search_path");
+
+    let search_path: &str = path_row.get(0);
+    println!("search_path = {}", search_path);
+    assert!(
+        search_path.contains("api"),
+        "Expected search_path to contain 'api', got '{}'",
+        search_path
+    );
+
+    println!("=== Test passed: --init-sql handles multiple statements ===");
 }

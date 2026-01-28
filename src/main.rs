@@ -40,7 +40,10 @@ macro_rules! debug_log {
 
 enum Command {
     Serve(ServeArgs),
-    DumpDataDir { output_path: String },
+    DumpDataDir {
+        output_path: String,
+        extensions: Vec<String>,
+    },
 }
 
 struct ServeArgs {
@@ -48,6 +51,8 @@ struct ServeArgs {
     tcp_port: u16,
     multiplexer_mode: Option<String>,
     daemon: bool,
+    extensions: Vec<String>,
+    init_sql: Option<String>,
 }
 
 impl Command {
@@ -59,8 +64,38 @@ impl Command {
                 eprintln!("Usage: {} --dump-datadir <output_path>", args[0]);
                 std::process::exit(1);
             }
+            let output_path = args[2].clone();
+            let mut extensions: Option<Vec<String>> = None;
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--extensions" => {
+                        if i + 1 < args.len() {
+                            extensions = Some(parse_extensions(&args[i + 1]));
+                            i += 2;
+                        } else {
+                            eprintln!("Error: --extensions requires a comma-separated list");
+                            std::process::exit(1);
+                        }
+                    }
+                    arg if arg.starts_with("--") => {
+                        eprintln!("Unknown argument: {}", arg);
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        eprintln!("Unknown argument: {}", args[i]);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let env_extensions = env::var("PGLITED_EXTENSIONS").ok();
+            let extensions = extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
+
             return Ok(Command::DumpDataDir {
-                output_path: args[2].clone(),
+                output_path,
+                extensions: extensions.unwrap_or_default(),
             });
         }
 
@@ -75,6 +110,8 @@ impl Command {
             .context("tcp_port must be a valid port number (1-65535)")?;
         let mut multiplexer_mode: Option<String> = None;
         let mut daemon = false;
+        let mut extensions: Option<Vec<String>> = None;
+        let mut init_sql: Option<String> = None;
 
         let mut i = 3;
         while i < args.len() {
@@ -92,6 +129,24 @@ impl Command {
                     daemon = true;
                     i += 1;
                 }
+                "--extensions" => {
+                    if i + 1 < args.len() {
+                        extensions = Some(parse_extensions(&args[i + 1]));
+                        i += 2;
+                    } else {
+                        eprintln!("Error: --extensions requires a comma-separated list");
+                        std::process::exit(1);
+                    }
+                }
+                "--init-sql" => {
+                    if i + 1 < args.len() {
+                        init_sql = Some(args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        eprintln!("Error: --init-sql requires a SQL statement");
+                        std::process::exit(1);
+                    }
+                }
                 arg if arg.starts_with("--") => {
                     eprintln!("Unknown argument: {}", arg);
                     std::process::exit(1);
@@ -103,11 +158,19 @@ impl Command {
             }
         }
 
+        let env_extensions = env::var("PGLITED_EXTENSIONS").ok();
+        let extensions = extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
+
+        let env_init_sql = env::var("PGLITED_INIT_SQL").ok();
+        let init_sql = init_sql.or(env_init_sql);
+
         Ok(Command::Serve(ServeArgs {
             data_dir,
             tcp_port,
             multiplexer_mode,
             daemon,
+            extensions: extensions.unwrap_or_default(),
+            init_sql,
         }))
     }
 
@@ -116,7 +179,10 @@ impl Command {
             "Usage: {} <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon]",
             program_name
         );
-        eprintln!("       {} --dump-datadir <output_path>", program_name);
+        eprintln!(
+            "       {} --dump-datadir <output_path> [--extensions <list>]",
+            program_name
+        );
         eprintln!();
         eprintln!("Commands:");
         eprintln!("  --dump-datadir <path>    - Dump initialized PostgreSQL data directory to a tar.gz file");
@@ -128,11 +194,31 @@ impl Command {
         eprintln!("Options:");
         eprintln!("  --multiplexer <mode>     - Enable connection multiplexer (mode: queue)");
         eprintln!("  --daemon                 - Start in background threaded (blocking) mode");
+        eprintln!("  --extensions <list>      - Comma-separated PGlite extensions");
+        eprintln!("  --init-sql <sql>         - SQL to run after PostgreSQL starts");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} memory:// 5432", program_name);
+        eprintln!(
+            "  {} memory:// 5432 --extensions pg_trgm,vector",
+            program_name
+        );
+        eprintln!("  {} memory:// 5432 --init-sql \"ALTER DATABASE template1 SET search_path TO myschema, public\"", program_name);
         eprintln!("  {} --dump-datadir pgdata_seed.tar.gz", program_name);
+        eprintln!(
+            "  {} --dump-datadir pgdata_seed.tar.gz --extensions pg_trgm,vector",
+            program_name
+        );
     }
+}
+
+fn parse_extensions(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
 }
 
 impl ServeArgs {
@@ -140,6 +226,7 @@ impl ServeArgs {
         PgliteConfig {
             data_dir: self.data_dir,
             tcp_port: self.tcp_port,
+            extensions: self.extensions,
         }
     }
 }
@@ -196,8 +283,11 @@ async fn main() -> Result<()> {
     }
 
     match command {
-        Command::DumpDataDir { output_path } => {
-            return dump_datadir_command(&output_path).await;
+        Command::DumpDataDir {
+            output_path,
+            extensions,
+        } => {
+            return dump_datadir_command(&output_path, extensions).await;
         }
         Command::Serve(args) => {
             return serve_command(args).await;
@@ -205,7 +295,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn dump_datadir_command(output_path: &str) -> Result<()> {
+async fn dump_datadir_command(output_path: &str, extensions: Vec<String>) -> Result<()> {
     use std::fs::File;
     use std::io::Write;
 
@@ -214,6 +304,7 @@ async fn dump_datadir_command(output_path: &str) -> Result<()> {
     let config = PgliteConfig {
         data_dir: "memory://".to_string(),
         tcp_port: 0,
+        extensions,
     };
 
     let runtime = tokio::task::spawn_blocking(move || -> Result<PgliteRuntime> {
@@ -245,11 +336,18 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     if args.daemon {
         debug_log!("Daemon Mode: enabled");
     }
+    if !args.extensions.is_empty() {
+        debug_log!("Extensions: {}", args.extensions.join(","));
+    }
+    if let Some(ref sql) = args.init_sql {
+        debug_log!("Init SQL: {}", sql);
+    }
     debug_log!("Process ID: {}", std::process::id());
 
     let tcp_port = args.tcp_port;
     let multiplexer_mode = args.multiplexer_mode.clone();
     let daemon = args.daemon;
+    let init_sql = args.init_sql.clone();
     let config = args.into_config();
 
     debug_log!("\n=== Step 1: Creating Runtime ===");
@@ -263,6 +361,18 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         debug_log!("\n=== Step 2: Initializing PostgreSQL ===");
         runtime.init_postgres()?;
         debug_log!("✓ PostgreSQL initialized");
+
+        // Execute init SQL if provided
+        if let Some(ref sql) = init_sql {
+            debug_log!("\n=== Step 2.5: Running Init SQL ===");
+            debug_log!("  SQL: {}", sql);
+            match runtime.execute_sql(sql) {
+                Ok(_) => debug_log!("✓ Init SQL executed successfully"),
+                Err(e) => {
+                    eprintln!("Warning: Init SQL failed: {:?}", e);
+                }
+            }
+        }
 
         Ok(Arc::new(runtime))
     })
@@ -403,4 +513,19 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     drop(runtime);
     debug_log!("[SHUTDOWN] Clean exit");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_extensions;
+
+    #[test]
+    fn parse_extensions_trims_and_skips_empty() {
+        let extensions = parse_extensions(" pg_trgm , ,vector, ");
+
+        assert_eq!(
+            extensions,
+            vec!["pg_trgm".to_string(), "vector".to_string()]
+        );
+    }
 }

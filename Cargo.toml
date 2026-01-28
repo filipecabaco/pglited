@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+flate2 = "1.0"
 once_cell = "1.19"
 regex = "1"
 deno_core = "0.382"
