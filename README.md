@@ -77,8 +77,8 @@ template1=# select * from users;
 ## Command Line Options
 
 ```bash
-Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon]
-       pglited --dump-datadir <output_path>
+Usage: pglited <data_dir> <tcp_port> [--multiplexer <mode>] [--daemon] [--extensions <list>]
+       pglited --dump-datadir <output_path> [--extensions <list>]
 
 Commands:
   --dump-datadir <path>    Dump initialized PostgreSQL data directory to a tar file
@@ -90,6 +90,7 @@ Arguments:
 Options:
   --multiplexer <mode>     Enable connection multiplexer (mode: queue)
   --daemon                 Start in background threaded (blocking) mode
+  --extensions <list>      Comma-separated PGlite extensions
 
 Examples:
   # In-memory database
@@ -103,6 +104,12 @@ Examples:
 
   # Persistent database (daemon mode)
   ./target/release/pglited /tmp/mydb 5432 --daemon
+
+  # Load extensions
+  ./target/release/pglited memory:// 5432 --extensions pg_trgm,vector
+
+  # Generate a seed with extensions preloaded
+  ./target/release/pglited --dump-datadir pgdata_seed.tar --extensions pg_trgm,vector
 ```
 
 ## Build Targets
@@ -191,6 +198,7 @@ The server implements PostgreSQL wire protocol handling:
 ## Environment Variables
 
 - `PGLITE_DEBUG=1` - Enable verbose debug output
+- `PGLITED_EXTENSIONS=pg_trgm,vector` - Default extensions to load
 
 ## Testing
 

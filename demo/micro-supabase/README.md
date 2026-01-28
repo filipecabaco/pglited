@@ -28,7 +28,6 @@ The script will:
 | `deno` | Runs the seed script | [deno.land](https://deno.land) |
 | `curl` | Downloads binaries & verifies endpoints | Usually pre-installed |
 | `tar` / `xz` | Extracts release archives | `brew install xz` (macOS) / `apt install xz-utils` (Linux) |
-| `go` | Builds Auth from source on macOS (no macOS binaries published) | [go.dev/dl](https://go.dev/dl/) |
 
 ## Architecture
 
@@ -112,8 +111,8 @@ The JWT secret is shared between Auth and PostgREST so that tokens issued by Aut
 |----------|------|-----------|
 | Linux x86_64 | Binary download | Binary download |
 | Linux ARM64 | Binary download | Binary download |
-| macOS ARM64 | Built from source (requires Go) | Binary download |
-| macOS x86_64 | Built from source (requires Go) | ARM64 binary via Rosetta 2 |
+| macOS ARM64 | Binary download | Binary download |
+| macOS x86_64 | Binary download | ARM64 binary via Rosetta 2 |
 
 ## Cleanup
 

@@ -2,12 +2,14 @@ use anyhow::{Context, Result};
 use deno_core::{
     extension, serde_v8, v8, FastString, JsRuntime, ModuleLoadOptions, ModuleLoadReferrer,
     ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
-    ResolutionKind, RuntimeOptions,
+    PollEventLoopOptions, ResolutionKind, RuntimeOptions,
 };
 use deno_error::JsErrorBox;
+use flate2::read::GzDecoder;
 use regex::Regex;
 use rust_embed::Embed;
 use serde::de::DeserializeOwned;
+use serde_json::json;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
@@ -17,6 +19,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+fn debug_enabled() -> bool {
+    std::env::var("PGLITE_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+fn debug_log(message: &str) {
+    if debug_enabled() {
+        eprintln!("[pglited-js] {}", message);
+    }
+}
 
 // File descriptor table for managing open files
 thread_local! {
@@ -61,11 +75,11 @@ use crate::{PgliteConfig, WireProcessor};
 
 #[derive(Embed)]
 #[folder = "assets/pglite_npm/dist"]
-#[include = "*.js"]
-#[include = "*.wasm"]
-#[include = "*.data"]
-#[include = "*.tar.gz"]
-#[include = "*.tar"]
+#[include = "**/*.js"]
+#[include = "**/*.wasm"]
+#[include = "**/*.data"]
+#[include = "**/*.tar.gz"]
+#[include = "**/*.tar"]
 struct PgliteAssets;
 
 #[derive(Embed)]
@@ -100,9 +114,10 @@ impl PgliteRuntime {
         let (sender, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let data_dir = config.data_dir.clone();
+        let extensions = config.extensions.clone();
 
         thread::spawn(move || {
-            run_js_runtime(receiver, &data_dir, ready_tx);
+            run_js_runtime(receiver, &data_dir, extensions, ready_tx);
         });
 
         ready_rx
@@ -163,6 +178,23 @@ fn module_error(msg: impl Into<String>) -> deno_core::error::ModuleLoaderError {
     JsErrorBox::generic(msg.into())
 }
 
+fn normalize_asset_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if !parts.is_empty() {
+                parts.pop();
+            }
+            continue;
+        }
+        parts.push(part);
+    }
+    parts.join("/")
+}
+
 fn get_embedded_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
     let mut normalized = path
         .strip_prefix("pglite:///")
@@ -171,18 +203,21 @@ fn get_embedded_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
         .unwrap_or(path);
 
     normalized = normalized.strip_prefix('/').unwrap_or(normalized);
-    normalized = normalized.strip_prefix("./").unwrap_or(normalized);
 
-    while normalized.contains("./") {
-        normalized = normalized.strip_prefix("./").unwrap_or(normalized);
+    // normalize_asset_path handles all . and .. segments properly
+    let normalized = normalize_asset_path(normalized);
+
+    let asset = PgliteAssets::get(&normalized)
+        .or_else(|| {
+            let without_dist = normalized.strip_prefix("dist/").unwrap_or(&normalized);
+            PgliteAssets::get(without_dist)
+        });
+
+    if asset.is_none() {
+        debug_log(&format!("Embedded asset not found: {}", normalized));
     }
 
-    PgliteAssets::get(normalized)
-        .or_else(|| {
-            let without_dist = normalized.strip_prefix("dist/").unwrap_or(normalized);
-            PgliteAssets::get(without_dist)
-        })
-        .map(|f| f.data)
+    asset.map(|f| f.data)
 }
 
 fn get_js_shim_asset(name: &str) -> Option<String> {
@@ -201,7 +236,7 @@ fn extract_asset_path_from_specifier(specifier: &ModuleSpecifier) -> String {
     }
 
     let path = specifier.path();
-    path.strip_prefix('/').unwrap_or(path).to_string()
+    normalize_asset_path(path.strip_prefix('/').unwrap_or(path))
 }
 
 impl ModuleLoader for EmbeddedModuleLoader {
@@ -374,12 +409,33 @@ if (typeof process === 'undefined') {
     }
 }
 
+fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut decoder = GzDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
+}
+
 #[deno_core::op2]
 #[buffer]
 fn op_read_file(#[string] path: String) -> std::result::Result<Vec<u8>, std::io::Error> {
     get_embedded_asset(&path)
-        .map(|data| data.to_vec())
+        .map(|data| {
+            let vec = data.to_vec();
+
+            // Auto-decompress .tar.gz files so PGlite can read them directly
+            // (PGlite tries to use DecompressionStream which we don't have)
+            if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+                match decompress_gzip(&vec) {
+                    Ok(decompressed) => return decompressed,
+                    Err(_) => {} // Fall back to returning raw data
+                }
+            }
+
+            vec
+        })
         .ok_or_else(|| {
+            debug_log(&format!("Embedded asset not found: {}", path));
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Embedded asset not found: {}", path),
@@ -699,11 +755,77 @@ extension!(
     ],
 );
 
+fn build_extensions_loader_js(extensions: &[String]) -> String {
+    if extensions.is_empty() {
+        return "const __pgliteRequestedExtensions = [];\nconst __pgliteExtensions = undefined;"
+            .to_string();
+    }
+
+    let mut specs = serde_json::Map::new();
+    specs.insert(
+        "live".to_string(),
+        json!({ "module": "pglite:///live/index.js", "exportName": "live" }),
+    );
+    specs.insert(
+        "vector".to_string(),
+        json!({ "module": "pglite:///vector/index.js", "exportName": "vector" }),
+    );
+    specs.insert(
+        "pg_hashids".to_string(),
+        json!({ "module": "pglite:///pg_hashids/index.js", "exportName": "pg_hashids" }),
+    );
+    specs.insert(
+        "pg_ivm".to_string(),
+        json!({ "module": "pglite:///pg_ivm/index.js", "exportName": "pg_ivm" }),
+    );
+    specs.insert(
+        "pg_uuidv7".to_string(),
+        json!({ "module": "pglite:///pg_uuidv7/index.js", "exportName": "pg_uuidv7" }),
+    );
+    specs.insert(
+        "pgtap".to_string(),
+        json!({ "module": "pglite:///pgtap/index.js", "exportName": "pgtap" }),
+    );
+
+    let specs_json = serde_json::Value::Object(specs).to_string();
+    let requested_json = serde_json::to_string(extensions).unwrap_or_else(|_| "[]".to_string());
+
+    format!(
+        r#"
+        const __pgliteExtensionSpecs = {};
+        const __pgliteRequestedExtensions = {};
+        let __pgliteExtensions = undefined;
+        if (__pgliteRequestedExtensions.length > 0) {{
+            __pgliteExtensions = {{}};
+            for (const name of __pgliteRequestedExtensions) {{
+                const spec = __pgliteExtensionSpecs[name];
+                const modulePath = spec?.module ?? `pglite:///contrib/${{name}}.js`;
+                const exportName = spec?.exportName ?? name;
+                let mod;
+                try {{
+                    mod = await import(modulePath);
+                }} catch (err) {{
+                    throw new Error(`Unknown extension: ${{name}}: ${{err}}`);
+                }}
+                const ext = mod[exportName];
+                if (!ext) {{
+                    throw new Error(`Extension export missing: ${{name}}`);
+                }}
+                __pgliteExtensions[name] = ext;
+            }}
+        }}
+        "#,
+        specs_json, requested_json
+    )
+}
+
 fn run_js_runtime(
     receiver: mpsc::Receiver<JsRequest>,
     data_dir: &str,
+    extensions: Vec<String>,
     ready_tx: mpsc::Sender<Result<()>>,
 ) {
+    debug_log("Starting JS runtime thread");
     let tokio_rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -731,11 +853,27 @@ fn run_js_runtime(
             ..Default::default()
         });
 
+        debug_log("JS runtime created");
+
         let data_dir_str = normalize_data_dir(data_dir);
 
-        let debug_enabled = cfg!(debug_assertions);
+        let debug_enabled = debug_enabled();
         let bootstrap_code = format!(
             r#"
+            // Debug logging (defined early so polyfills can use it)
+            const __pgliteDebugEnabled = {debug_enabled};
+            globalThis.__pgliteDebug = __pgliteDebugEnabled;
+            const debugLog = (...args) => {{
+                if (__pgliteDebugEnabled) {{
+                    console.log(...args);
+                }}
+            }};
+            const debugError = (...args) => {{
+                if (__pgliteDebugEnabled) {{
+                    console.error(...args);
+                }}
+            }};
+
             // TextEncoder polyfill (UTF-8 only)
             if (typeof TextEncoder === 'undefined') {{
                 globalThis.TextEncoder = class TextEncoder {{
@@ -1211,14 +1349,6 @@ fn run_js_runtime(
                 }};
             }}
 
-            globalThis.__pgliteDebug = {debug_enabled};
-            const debugLog = (...args) => {{
-                if (globalThis.__pgliteDebug) console.log(...args);
-            }};
-            const debugError = (...args) => {{
-                if (globalThis.__pgliteDebug) console.error(...args);
-            }};
-
             // Make fs and path available globally
             globalThis.fs = fsModule;
             globalThis.path = pathModule;
@@ -1415,7 +1545,12 @@ fn run_js_runtime(
 
             globalThis.fetch = async (url) => {{
                 const urlStr = String(url.href || url);
-                const buffer = globalThis.__pgliteReadFile(urlStr);
+                let buffer;
+                try {{
+                    buffer = globalThis.__pgliteReadFile(urlStr);
+                }} catch (fetchErr) {{
+                    throw fetchErr;
+                }}
 
                 let arrayBuffer;
                 if (buffer instanceof ArrayBuffer) {{
@@ -1439,12 +1574,31 @@ fn run_js_runtime(
                                     ext === 'json' ? 'application/json' :
                                     'application/octet-stream';
 
-                const headers = new Map([['content-type', contentType], ['content-length', String(arrayBuffer.byteLength)]]);
+                // For .tar.gz files, the Rust op_read_file already decompressed them,
+                // so tell PGlite not to decompress again by setting content-encoding: gzip
+                // (PGlite checks for this header and skips DecompressionStream when present)
+                const isGzipped = urlStr.endsWith('.tar.gz') || urlStr.endsWith('.tgz');
+                const headers = new Map([
+                    ['content-type', contentType],
+                    ['content-length', String(arrayBuffer.byteLength)]
+                ]);
+                if (isGzipped) {{
+                    // PGlite checks Content-Encoding: gzip to decide to use blob() directly
+                    // Since we already decompressed, we set this header to skip DecompressionStream
+                    headers.set('content-encoding', 'gzip');
+                }}
+                const responseBlob = new Blob([new Uint8Array(arrayBuffer)], {{ type: contentType }});
                 return {{
                     ok: true,
                     status: 200,
                     statusText: 'OK',
                     url: urlStr,
+                    // PGlite checks for response.body to determine if fetch succeeded
+                    // We provide a minimal stub that makes the check pass
+                    body: {{
+                        getReader: () => {{ throw new Error('ReadableStream not implemented'); }},
+                        pipeThrough: () => {{ throw new Error('pipeThrough not implemented'); }},
+                    }},
                     headers: {{
                         get: (name) => headers.get(name.toLowerCase()),
                         has: (name) => headers.has(name.toLowerCase()),
@@ -1452,7 +1606,7 @@ fn run_js_runtime(
                     arrayBuffer: async () => arrayBuffer,
                     text: async () => new TextDecoder().decode(new Uint8Array(arrayBuffer)),
                     json: async () => JSON.parse(new TextDecoder().decode(new Uint8Array(arrayBuffer))),
-                    blob: async () => ({{ arrayBuffer: async () => arrayBuffer, type: contentType }}),
+                    blob: async () => responseBlob,
                     clone: function() {{ return this; }},
                 }};
             }};
@@ -1468,6 +1622,8 @@ fn run_js_runtime(
             .execute_script("<bootstrap>", bootstrap_code)
             .context("Failed to execute bootstrap code")?;
 
+        debug_log("Bootstrap loaded");
+
         let module_specifier = ModuleSpecifier::parse("pglite:///index.js")
             .map_err(|e| anyhow::anyhow!("Invalid module specifier: {}", e))?;
 
@@ -1480,6 +1636,8 @@ fn run_js_runtime(
         runtime.run_event_loop(Default::default()).await?;
         eval_result.await?;
 
+        debug_log("PGlite module evaluated");
+
         // Determine if we should use the custom filesystem
         let use_custom_fs = data_dir_str.starts_with("file://");
         let actual_path = if use_custom_fs {
@@ -1488,6 +1646,7 @@ fn run_js_runtime(
             &data_dir_str
         };
 
+        let extensions_loader = build_extensions_loader_js(&extensions);
         let init_code = if use_custom_fs {
             format!(
                 r#"
@@ -1496,54 +1655,38 @@ fn run_js_runtime(
                         const mod = await import("pglite:///index.js");
                         const fsBase = await import("pglite:///fs/base.js");
                         const {{ createRustBackedFilesystem, extractTar }} = await import("pglite:///shims/rust_backed_filesystem.js");
+                        {}
+                        globalThis.__pgliteExtensionNames = __pgliteRequestedExtensions;
 
                         const {{ ops }} = Deno.core;
                         const dataDir = "{}";
-
-                        debugLog('[Init] BaseFilesystem type:', typeof fsBase.BaseFilesystem);
-                        debugLog('[Init] dataDir:', dataDir);
 
                         if (!ops.op_fs_exists_sync(dataDir)) {{
                             ops.op_fs_mkdir_sync(dataDir, true);
                         }}
 
                         const RustBackedFilesystem = createRustBackedFilesystem(fsBase.BaseFilesystem, ops, dataDir);
-                        debugLog('[Init] RustBackedFilesystem class:', typeof RustBackedFilesystem);
-
                         const customFs = new RustBackedFilesystem();
-                        debugLog('[Init] customFs instance:', customFs);
 
                         const pgVersionPath = dataDir + '/PG_VERSION';
                         const dbExists = ops.op_fs_exists_sync(pgVersionPath);
 
                         if (!dbExists) {{
-                            debugLog('[Init] Extracting seed tar...');
-                            try {{
-                                const seedResp = await fetch('pglite:///pgdata_seed.tar');
-                                debugLog('[Init] Fetch response ok:', seedResp.ok, 'status:', seedResp.status);
-                                const tarData = new Uint8Array(await seedResp.arrayBuffer());
-                                debugLog('[Init] Tar data size:', tarData.length);
-                                extractTar(tarData, dataDir, ops);
-                                debugLog('[Init] Seed extraction complete');
-                            }} catch (extractErr) {{
-                                debugError('[Init] Seed extraction failed:', extractErr);
-                                if (extractErr && extractErr.stack) debugError('[Init] Extract error stack:', extractErr.stack);
-                                throw extractErr;
-                            }}
+                            const seedResp = await fetch('pglite:///pgdata_seed.tar');
+                            const tarData = new Uint8Array(await seedResp.arrayBuffer());
+                            extractTar(tarData, dataDir, ops);
                         }}
 
-                        const pg = await mod.PGlite.create({{ fs: customFs }});
+                        const pg = await mod.PGlite.create({{ fs: customFs, extensions: __pgliteExtensions }});
                         globalThis.__pgliteInstance = pg;
                         globalThis.__pgliteIsReady = true;
-                        debugLog('[Init] PGlite initialized successfully');
                     }} catch (err) {{
-                        debugError('[Init] Error:', err);
-                        if (err && err.stack) debugError('[Init] Stack:', err.stack);
                         globalThis.__pgliteInitError = String(err);
                         throw err;
                     }}
                 }})();
                 "#,
+                extensions_loader,
                 actual_path.replace('\\', "\\\\").replace('"', "\\\"")
             )
         } else {
@@ -1552,8 +1695,12 @@ fn run_js_runtime(
                 (async () => {{
                     try {{
                         const mod = await import("pglite:///index.js");
+                        {}
+                        globalThis.__pgliteExtensionNames = __pgliteRequestedExtensions;
                         const options = {{ dataDir: "{}" }};
-
+                        if (__pgliteExtensions) {{
+                            options.extensions = __pgliteExtensions;
+                        }}
                         const pg = await mod.PGlite.create(options);
                         globalThis.__pgliteInstance = pg;
                         globalThis.__pgliteIsReady = true;
@@ -1563,6 +1710,7 @@ fn run_js_runtime(
                     }}
                 }})();
                 "#,
+                extensions_loader,
                 data_dir_str.replace('\\', "\\\\").replace('"', "\\\"")
             )
         };
@@ -1571,22 +1719,31 @@ fn run_js_runtime(
             .execute_script("<init>", init_code)
             .context("Failed to start PGlite initialization")?;
 
-        runtime.run_event_loop(Default::default()).await?;
+        debug_log("Init script executed");
 
+        // Run the event loop to completion - this processes all async work including
+        // dynamic imports used by extensions. The run_event_loop() call will return
+        // when all promises have settled (either resolved or rejected).
+        runtime.run_event_loop(PollEventLoopOptions::default()).await?;
+
+        debug_log("Init event loop finished");
+
+        // Check for initialization errors
+        let error_global = runtime
+            .execute_script("<check_error>", "globalThis.__pgliteInitError")
+            .context("Failed to check error")?;
+        let error: Option<String> = extract_value(&mut runtime, error_global)?;
+        if let Some(error) = error {
+            return Err(anyhow::anyhow!("PGlite init error: {}", error));
+        }
+
+        // Verify initialization succeeded
         let ready_global = runtime
             .execute_script("<check_ready>", "globalThis.__pgliteIsReady")
             .context("Failed to check ready state")?;
         let ready: bool = extract_value(&mut runtime, ready_global)?;
-
         if !ready {
-            let error_global = runtime
-                .execute_script(
-                    "<check_error>",
-                    "globalThis.__pgliteInitError || 'Unknown error'",
-                )
-                .context("Failed to check error")?;
-            let error: String = extract_value(&mut runtime, error_global)?;
-            return Err(anyhow::anyhow!("PGlite init error: {}", error));
+            return Err(anyhow::anyhow!("PGlite initialization did not complete"));
         }
 
         runtime
@@ -1644,11 +1801,43 @@ fn run_js_runtime(
                 runtime.v8_isolate().perform_microtask_checkpoint();
             }
             Ok(JsRequest::DumpDataDir(response_tx)) => {
-                let result = dump_data_dir_sync(&mut runtime, &tokio_rt);
+                let result = dump_data_dir_sync(&mut runtime, &tokio_rt, &extensions);
                 let _ = response_tx.send(result);
             }
             Ok(JsRequest::Shutdown) | Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_extensions_loader_js, normalize_asset_path};
+
+    #[test]
+    fn build_extensions_loader_js_empty() {
+        let code = build_extensions_loader_js(&[]);
+
+        assert!(code.contains("const __pgliteExtensions = undefined"));
+    }
+
+    #[test]
+    fn build_extensions_loader_js_includes_requested() {
+        let code = build_extensions_loader_js(&[
+            "pg_trgm".to_string(),
+            "vector".to_string(),
+        ]);
+
+        assert!(code.contains("\"pg_trgm\""));
+        assert!(code.contains("\"vector\""));
+        assert!(code.contains("pglite:///vector/index.js"));
+        assert!(code.contains("contrib"));
+    }
+
+    #[test]
+    fn normalize_asset_path_resolves_dot_segments() {
+        let path = normalize_asset_path("contrib/../pg_trgm.tar.gz");
+
+        assert_eq!(path, "pg_trgm.tar.gz");
     }
 }
 
@@ -1716,7 +1905,42 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8
 fn dump_data_dir_sync(
     runtime: &mut JsRuntime,
     tokio_rt: &tokio::runtime::Runtime,
+    extensions: &[String],
 ) -> Result<Vec<u8>> {
+    if !extensions.is_empty() {
+        let install_code = format!(
+            r#"
+            globalThis.__seedExtensionError = null;
+            (async () => {{
+                try {{
+                    const pg = globalThis.__pgliteInstance;
+                    const names = {};
+                    for (const name of names) {{
+                        if (name === 'live') continue;
+                        await pg.exec(`CREATE EXTENSION IF NOT EXISTS "${{name}}"`);
+                    }}
+                }} catch (e) {{
+                    globalThis.__seedExtensionError = String(e);
+                }}
+            }})();
+            "#,
+            serde_json::to_string(extensions).unwrap_or_else(|_| "[]".to_string())
+        );
+        runtime
+            .execute_script("<seed_extensions>", install_code)
+            .context("Failed to start extension install")?;
+
+        tokio_rt.block_on(async { runtime.run_event_loop(Default::default()).await })?;
+
+        let error_global = runtime
+            .execute_script("<seed_extensions_error>", "globalThis.__seedExtensionError")
+            .context("Failed to check extension install error")?;
+        let error: Option<String> = extract_value(runtime, error_global)?;
+        if let Some(e) = error {
+            return Err(anyhow::anyhow!("Extension install error: {}", e));
+        }
+    }
+
     runtime
         .execute_script(
             "<dump_setup>",

@@ -18,6 +18,47 @@ console.log("Creating extensions...");
 await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
 await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
 
+// Auth schema required by Supabase Auth (migrations run there)
+console.log("Creating auth schema...");
+await sql`CREATE SCHEMA IF NOT EXISTS auth`;
+
+// Pre-create types in auth schema that migrations expect but create without namespace prefix
+// This fixes a bug where some migrations use "create type foo" instead of "create type auth.foo"
+// but later migrations try to "alter type auth.foo"
+console.log("Pre-creating auth types...");
+await sql.unsafe(`
+  DO $$ BEGIN
+    CREATE TYPE auth.factor_type AS ENUM('totp', 'webauthn');
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$
+`);
+await sql.unsafe(`
+  DO $$ BEGIN
+    CREATE TYPE auth.factor_status AS ENUM('unverified', 'verified');
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$
+`);
+await sql.unsafe(`
+  DO $$ BEGIN
+    CREATE TYPE auth.aal_level AS ENUM('aal1', 'aal2', 'aal3');
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$
+`);
+await sql.unsafe(`
+  DO $$ BEGIN
+    CREATE TYPE auth.code_challenge_method AS ENUM('s256', 'plain');
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$
+`);
+await sql.unsafe(`
+  DO $$ BEGIN
+    CREATE TYPE auth.one_time_token_type AS ENUM(
+      'confirmation_token',
+      'reauthentication_token',
+      'recovery_token',
+      'email_change_token_new',
+      'email_change_token_current',
+      'phone_change_token'
+    );
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$
+`);
+
 // API schema for PostgREST
 console.log("Creating api schema...");
 await sql`CREATE SCHEMA IF NOT EXISTS api`;

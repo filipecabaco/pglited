@@ -20,7 +20,7 @@ cleanup() {
   echo "Shutting down..."
   [ -n "${AUTH_PID:-}" ]      && kill "$AUTH_PID"      2>/dev/null || true
   [ -n "${POSTGREST_PID:-}" ] && kill "$POSTGREST_PID" 2>/dev/null || true
-  [ -n "${PGLITED_PID:-}" ]   && kill "$PGLITED_PID"   2>/dev/null || true
+  pkill -f "pglited.*${PG_PORT}" 2>/dev/null || true
   wait 2>/dev/null || true
   echo "All processes stopped."
 }
@@ -44,19 +44,6 @@ echo "=== Micro-Supabase Demo ==="
 echo "    pglited + Supabase Auth + PostgREST"
 echo ""
 
-if [ ! -x "$PGLITED" ]; then
-  echo "pglited binary not found at $PGLITED"
-  echo "Run 'make build-release' in $REPO_ROOT first."
-  exit 1
-fi
-
-for cmd in curl tar deno; do
-  if ! command -v "$cmd" &>/dev/null; then
-    echo "Required command not found: $cmd"
-    exit 1
-  fi
-done
-
 # ── Detect OS / Arch ────────────────────────────────────────────
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -76,6 +63,24 @@ esac
 echo "Platform: ${OS_LABEL}/${ARCH_LABEL}"
 echo ""
 
+if [ ! -x "$PGLITED" ]; then
+  echo "pglited binary not found at $PGLITED"
+  echo "Run 'make build-release' in $REPO_ROOT first."
+  exit 1
+fi
+
+REQUIRED_CMDS="curl tar deno"
+if [ "$OS" = "Darwin" ]; then
+  REQUIRED_CMDS="$REQUIRED_CMDS git go"
+fi
+
+for cmd in $REQUIRED_CMDS; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Required command not found: $cmd"
+    exit 1
+  fi
+done
+
 # ── Download helpers ─────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
 
@@ -85,28 +90,29 @@ download_auth() {
     return
   fi
 
+  # macOS: build from source (pre-built binaries are Linux-only)
   if [ "$OS_LABEL" = "macos" ]; then
-    echo "Supabase Auth does not publish macOS binaries."
-    echo "Attempting to build from source with Go..."
     if ! command -v go &>/dev/null; then
-      echo ""
       echo "Go is required to build Auth on macOS."
-      echo "Install Go: https://go.dev/dl/"
-      echo "Or place a pre-built 'auth' binary in $BIN_DIR/"
+      echo "Install: brew install go"
       exit 1
     fi
-    local tmp_src
-    tmp_src="$(mktemp -d)"
-    git clone --depth 1 --branch "v${AUTH_VERSION}" \
-      https://github.com/supabase/auth.git "$tmp_src"
-    (cd "$tmp_src" && go build -o "$BIN_DIR/auth" .)
-    rm -rf "$tmp_src"
+
+    local auth_src="$BIN_DIR/auth-src"
+    if [ ! -d "$auth_src" ]; then
+      echo "Cloning supabase/auth v${AUTH_VERSION}..."
+      git clone --depth 1 --branch "v${AUTH_VERSION}" \
+        https://github.com/supabase/auth.git "$auth_src"
+    fi
+
+    echo "Building Auth from source (this may take a moment)..."
+    (cd "$auth_src" && go build -o "$BIN_DIR/auth" .)
     chmod +x "$BIN_DIR/auth"
-    echo "Auth built from source -> $BIN_DIR/auth"
+    echo "Auth built -> $BIN_DIR/auth"
     return
   fi
 
-  # Linux download
+  # Linux: download pre-built binary
   local asset
   case "$ARCH_LABEL" in
     x86_64) asset="auth-v${AUTH_VERSION}-x86.tar.gz"   ;;
@@ -166,8 +172,7 @@ echo ""
 
 # ── Step 2: Start pglited (in-memory) ──────────────────────────
 echo "--- Starting pglited (in-memory, port $PG_PORT) ---"
-"$PGLITED" "memory://" "$PG_PORT" &
-PGLITED_PID=$!
+"$PGLITED" "memory://" "$PG_PORT" --daemon --extensions uuid_ossp,pgcrypto
 
 echo "Waiting for pglited..."
 for i in $(seq 1 30); do
@@ -192,7 +197,6 @@ echo ""
 # ── Step 4: Start Auth ─────────────────────────────────────────
 echo "--- Starting Supabase Auth (port $AUTH_PORT) ---"
 env $(grep -v '^#' "$SCRIPT_DIR/auth.env" | grep -v '^\s*$' | xargs) \
-  GOTRUE_DB_MIGRATIONS_PATH="$BIN_DIR/migrations" \
   "$BIN_DIR/auth" &
 AUTH_PID=$!
 

@@ -107,12 +107,19 @@ fn ensure_pgdata_seed() {
         binary_path
     );
 
-    match Command::new(&binary_path)
+    let dist_dir = Path::new(&manifest_dir).join("assets/pglite_npm/dist");
+    let extensions = collect_seed_extensions(&dist_dir);
+
+    let mut command = Command::new(&binary_path);
+    command
         .arg("--dump-datadir")
         .arg(&seed_path)
-        .current_dir(&manifest_dir)
-        .output()
-    {
+        .current_dir(&manifest_dir);
+    if !extensions.is_empty() {
+        command.arg("--extensions").arg(extensions.join(","));
+    }
+
+    match command.output() {
         Ok(output) => {
             if output.status.success() {
                 if seed_path.exists() {
@@ -136,4 +143,46 @@ fn ensure_pgdata_seed() {
             println!("cargo:warning=Build once, then rebuild to generate pgdata_seed");
         }
     }
+}
+
+fn collect_seed_extensions(dist_dir: &Path) -> Vec<String> {
+    let mut extensions = Vec::new();
+
+    let contrib_dir = dist_dir.join("contrib");
+    if contrib_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&contrib_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
+                    continue;
+                }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".js") && !name.ends_with(".js.map") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            extensions.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let top_level = [
+        "vector",
+        "pg_ivm",
+        "pg_hashids",
+        "pg_uuidv7",
+        "pgtap",
+        "live",
+    ];
+    for name in top_level {
+        let candidate = dist_dir.join(name).join("index.js");
+        if candidate.exists() {
+            extensions.push(name.to_string());
+        }
+    }
+
+    extensions.sort();
+    extensions.dedup();
+    extensions
 }

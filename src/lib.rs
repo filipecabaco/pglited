@@ -14,6 +14,7 @@ static WASM_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::const_new(1));
 pub struct PgliteConfig {
     pub data_dir: String,
     pub tcp_port: u16,
+    pub extensions: Vec<String>,
 }
 
 pub trait WireProcessor: Send + Sync {
@@ -404,9 +405,11 @@ mod tests {
         let config = PgliteConfig {
             data_dir: "memory://test".to_string(),
             tcp_port: 5432,
+            extensions: vec!["pg_trgm".to_string()],
         };
 
         assert_eq!(config.data_dir, "memory://test");
         assert_eq!(config.tcp_port, 5432);
+        assert_eq!(config.extensions, vec!["pg_trgm".to_string()]);
     }
 }
