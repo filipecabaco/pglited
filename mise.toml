@@ -1,0 +1,40 @@
+[tools]
+rust = "stable"
+
+[tasks.build]
+description = "Build the debug binary"
+run = "cargo build"
+
+[tasks.release]
+description = "Build the optimized release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run the full test suite"
+run = "cargo test"
+
+[tasks.lint]
+description = "Check formatting and run clippy"
+run = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"]
+
+[tasks.seed]
+description = "Regenerate assets/pglite_npm/dist/pgdata_seed.tar"
+depends = ["build"]
+run = "./scripts/generate-seed.sh"
+
+[tasks.seed-clean]
+description = "Delete the pgdata seed so the next start falls back to initdb"
+run = "rm -f assets/pglite_npm/dist/pgdata_seed.tar"
+
+[tasks.assets-clean]
+description = "Delete downloaded PGlite assets so the next build re-fetches them"
+run = "rm -rf assets/pglite_npm"
+
+[tasks.upgrade-pglite]
+description = "Re-download PGlite assets and regenerate the seed"
+run = [
+  "rm -rf assets/pglite_npm",
+  "cargo build",
+  "./scripts/generate-seed.sh",
+  "cargo build",
+]

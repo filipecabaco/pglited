@@ -23,10 +23,43 @@ function joinPath(base, child) {
     return base + child;
 }
 
+const EPERM = 63;
+
 function makeError(kind, path, code) {
     const err = new Error(kind + ': ' + path);
     err.code = code;
     return err;
+}
+
+// Collapse '.' and '..' without touching the filesystem.
+function normalizePath(path) {
+    const isAbsolute = path.startsWith('/');
+    const out = [];
+    for (const part of path.split('/')) {
+        if (!part || part === '.') continue;
+        if (part === '..') {
+            if (out.length > 0 && out[out.length - 1] !== '..') {
+                out.pop();
+            } else if (!isAbsolute) {
+                out.push('..');
+            }
+            continue;
+        }
+        out.push(part);
+    }
+    const joined = out.join('/');
+    if (isAbsolute) return '/' + joined;
+    return joined || '.';
+}
+
+// True when `child` is `root` itself or lives underneath it. Compares whole
+// path segments so '/data/pg-other' is not treated as being inside '/data/pg'.
+function isInside(root, child) {
+    const normalizedRoot = normalizePath(root).replace(/\/+$/, '') || '/';
+    const normalizedChild = normalizePath(child);
+    if (normalizedChild === normalizedRoot) return true;
+    const prefix = normalizedRoot === '/' ? '/' : normalizedRoot + '/';
+    return normalizedChild.startsWith(prefix);
 }
 
 export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
@@ -63,9 +96,14 @@ export function createRustBackedFilesystem(BaseFilesystem, ops, dataDir) {
             // No cleanup needed
         }
 
-        // Map VFS path to actual filesystem path
+        // Map VFS path to actual filesystem path. Paths come from Postgres
+        // running in WASM, so '..' must not escape the data directory.
         _mapPath(vfsPath) {
-            return joinPath(this._dataDir, vfsPath);
+            const mapped = normalizePath(joinPath(this._dataDir, vfsPath));
+            if (!isInside(this._dataDir, mapped)) {
+                throw makeError('EPERM', vfsPath, EPERM);
+            }
+            return mapped;
         }
 
         chmod(path, mode) {
@@ -248,8 +286,18 @@ export function extractTar(tarData, dataDir, ops) {
 
             const type = header[156] - 48;
             const dataStart = offset + 512;
+            if (size < 0 || dataStart + size > tarData.length) {
+                throw new Error('Malformed tar: entry ' + name + ' runs past end of archive');
+            }
             const data = size > 0 ? tarData.slice(dataStart, dataStart + size) : new Uint8Array(0);
-            const fullPath = joinPath(dataDir, name);
+
+            // Strip any leading '/' the way tar does, then confirm the result
+            // lands inside the data directory before writing anything.
+            const relativeName = name.replace(/^\/+/, '');
+            const fullPath = normalizePath(joinPath(dataDir, relativeName));
+            if (!relativeName || !isInside(dataDir, fullPath)) {
+                throw new Error('Refusing to extract tar entry outside the data directory: ' + name);
+            }
 
             if (fileCount < 5 || dirCount < 5) {
                 debugLog('[extractTar] File:', name, 'type:', type, 'size:', size, 'fullPath:', fullPath);

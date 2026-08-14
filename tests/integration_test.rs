@@ -14,6 +14,15 @@ impl TestInstance {
     }
 
     fn start_with_args(data_dir: &str, tcp_port: u16, extra_args: &[&str]) -> Result<Self, String> {
+        Self::start_with_env(data_dir, tcp_port, extra_args, &[])
+    }
+
+    fn start_with_env(
+        data_dir: &str,
+        tcp_port: u16,
+        extra_args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<Self, String> {
         let exe_dir =
             std::env::current_exe().map_err(|e| format!("Failed to get current exe: {}", e))?;
 
@@ -45,7 +54,12 @@ impl TestInstance {
         eprintln!("Starting binary: {:?}", binary_path);
         eprintln!("Args: {} {}", data_dir, tcp_port);
 
-        let process = Command::new(&binary_path)
+        let mut command = Command::new(&binary_path);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+
+        let process = command
             .args([data_dir, &tcp_port.to_string()])
             .args(extra_args)
             .stdin(Stdio::piped())
@@ -903,4 +917,183 @@ async fn test_init_sql_multiple_statements() {
     );
 
     println!("=== Test passed: --init-sql handles multiple statements ===");
+}
+
+/// Reproduction: a single wire message larger than the socket read buffer must
+/// still be executed correctly (it arrives split across several TCP reads).
+#[tokio::test]
+async fn test_large_query_exceeding_read_buffer() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://large_query_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    let mut instance = TestInstance::start(&data_dir, tcp_port).expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    let (client, connection) = client_conn.expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute("CREATE TABLE big (id INT PRIMARY KEY, payload TEXT)", &[])
+        .await
+        .expect("Failed to create table");
+
+    // ~512 KB literal -> single Query message far bigger than the 64 KiB read buffer
+    let payload = "x".repeat(512 * 1024);
+    let sql = format!("INSERT INTO big (id, payload) VALUES (1, '{}')", payload);
+
+    client
+        .simple_query(&sql)
+        .await
+        .expect("Failed to insert large payload");
+
+    let rows = client
+        .query("SELECT length(payload) FROM big WHERE id = 1", &[])
+        .await
+        .expect("Failed to read back payload");
+
+    assert_eq!(rows.len(), 1);
+    let len: i32 = rows[0].get(0);
+    assert_eq!(len as usize, payload.len());
+
+    drop(client);
+    drop(instance);
+}
+
+/// pgvector ships as a separate npm package since PGlite 0.4; this proves the
+/// build wiring that pulls it back in still produces a usable extension.
+#[tokio::test]
+async fn test_vector_extension_loads() {
+    use tokio_postgres::NoTls;
+
+    let data_dir = format!("memory://vector_test_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    let mut instance =
+        TestInstance::start_with_args(&data_dir, tcp_port, &["--extensions", "vector"])
+            .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    let connection_string = format!(
+        "host=127.0.0.1 port={} user=postgres password=postgres",
+        tcp_port
+    );
+
+    let mut client_conn = None;
+    for attempt in 1..=10 {
+        match tokio_postgres::connect(&connection_string, NoTls).await {
+            Ok(conn) => {
+                client_conn = Some(conn);
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+
+    let (client, connection) = client_conn.expect("Failed to connect after retries");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .execute("CREATE EXTENSION IF NOT EXISTS vector", &[])
+        .await
+        .expect("Failed to create vector extension");
+
+    let row = client
+        .query_one(
+            "SELECT ('[1,2,3]'::vector <-> '[3,2,1]'::vector)::float8 AS dist",
+            &[],
+        )
+        .await
+        .expect("Failed to run a vector distance query");
+
+    let dist: f64 = row.get("dist");
+    assert!(
+        (dist - 8f64.sqrt()).abs() < 1e-9,
+        "Expected L2 distance sqrt(8), got {}",
+        dist
+    );
+}
+
+/// Connections beyond PGLITED_MAX_CONNECTIONS get a FATAL 53300 instead of
+/// silently exhausting threads and sockets.
+#[tokio::test]
+async fn test_connection_limit_rejects_excess_clients() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let data_dir = format!("memory://conn_limit_{}", std::process::id());
+    let tcp_port = allocate_port();
+
+    let mut instance = TestInstance::start_with_env(
+        &data_dir,
+        tcp_port,
+        &[],
+        &[("PGLITED_MAX_CONNECTIONS", "1")],
+    )
+    .expect("Failed to start instance");
+    instance
+        .wait_for_ready(75)
+        .expect("Instance failed to become ready");
+
+    // Hold the single slot open without completing startup.
+    let held = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+        .await
+        .expect("Failed to open the first connection");
+
+    // Give the server a moment to accept and account for it.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let mut rejected = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+        .await
+        .expect("Failed to open the second connection");
+
+    let mut startup = Vec::new();
+    let params = b"user\0postgres\0database\0postgres\0\0";
+    startup.extend_from_slice(&((8 + params.len()) as u32).to_be_bytes());
+    startup.extend_from_slice(&196608u32.to_be_bytes());
+    startup.extend_from_slice(params);
+    let _ = rejected.write_all(&startup).await;
+
+    let mut response = vec![0u8; 1024];
+    let n = rejected
+        .read(&mut response)
+        .await
+        .expect("Failed to read the rejection");
+
+    assert!(n > 0, "Expected an ErrorResponse, got an empty read");
+    assert_eq!(response[0], b'E', "Expected an ErrorResponse message");
+    assert!(
+        response[..n].windows(5).any(|w| w == b"53300"),
+        "Expected SQLSTATE 53300 (too_many_connections)"
+    );
+
+    drop(held);
+    drop(instance);
 }

@@ -2,45 +2,54 @@ use flate2::read::GzDecoder;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
 
-const PGLITE_VERSION: &str = "0.3.15";
-const PGLITE_NPM_TARBALL: &str =
-    "https://registry.npmjs.org/@electric-sql/pglite/-/pglite-0.3.15.tgz";
+const PGLITE_VERSION: &str = "0.5.4";
+
+/// Extensions that used to ship inside the `@electric-sql/pglite` tarball and
+/// now live in their own packages. Each one is laid out under
+/// `dist/<name>/`, which is where its `index.js` resolves its own
+/// `<name>.tar.gz` bundle from.
+const EXTENSION_PACKAGES: &[(&str, &str, &str)] = &[
+    // (directory name, npm package name, version)
+    ("vector", "pglite-pgvector", "0.0.6"),
+    ("pgtap", "pglite-pgtap", "0.0.6"),
+    ("pg_ivm", "pglite-pg_ivm", "0.0.6"),
+    ("pg_uuidv7", "pglite-pg_uuidv7", "0.0.6"),
+    ("pg_hashids", "pglite-pg_hashids", "0.0.6"),
+];
+
+fn npm_tarball_url(package: &str, version: &str) -> String {
+    format!(
+        "https://registry.npmjs.org/@electric-sql/{0}/-/{0}-{1}.tgz",
+        package, version
+    )
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/js");
+    println!("cargo:rerun-if-changed=assets/pglite_npm/dist/pgdata_seed.tar");
 
     fs::create_dir_all("assets").expect("Failed to create assets directory");
     ensure_npm_assets();
-    ensure_pgdata_seed();
+    ensure_extension_packages();
+    report_pgdata_seed();
     println!("cargo:warning=All assets ready");
 }
 
-fn ensure_npm_assets() {
-    let dist_dir = Path::new("assets/pglite_npm/dist");
-    let index_path = dist_dir.join("index.js");
-    if index_path.exists() {
-        return;
-    }
+/// Downloads an npm tarball and unpacks its `package/<subdir>` into `dest`.
+fn fetch_and_unpack(url: &str, strip_prefix: &str, dest: &Path) {
+    println!("cargo:warning=Fetching: {}", url);
 
-    fs::create_dir_all(dist_dir).expect("Failed to create npm assets directory");
-
-    println!(
-        "cargo:warning=Downloading pglite npm assets ({})...",
-        PGLITE_VERSION
-    );
-    println!("cargo:warning=Fetching: {}", PGLITE_NPM_TARBALL);
-
-    let response = ureq::get(PGLITE_NPM_TARBALL)
+    let response = ureq::get(url)
         .call()
-        .unwrap_or_else(|e| panic!("Failed to download pglite npm tarball: {}", e));
+        .unwrap_or_else(|e| panic!("Failed to download {}: {}", url, e));
 
     let mut compressed_data = Vec::new();
     response
         .into_reader()
         .read_to_end(&mut compressed_data)
-        .expect("Failed to read pglite npm tarball");
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", url, e));
 
     println!(
         "cargo:warning=Downloaded {:.2} MB, extracting...",
@@ -57,12 +66,20 @@ fn ensure_npm_assets() {
             .expect("Failed to read npm tar path")
             .to_path_buf();
 
-        let relative = match path.strip_prefix("package/dist") {
+        let relative = match path.strip_prefix(strip_prefix) {
             Ok(rel) => rel,
             Err(_) => continue,
         };
 
-        let dest_path = dist_dir.join(relative);
+        // npm tarballs are third-party input.
+        if relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            panic!("Refusing to unpack tar entry with '..': {:?}", path);
+        }
+
+        let dest_path = dest.join(relative);
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).expect("Failed to create asset subdirectory");
         }
@@ -73,116 +90,53 @@ fn ensure_npm_assets() {
     }
 }
 
-fn ensure_pgdata_seed() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let seed_path = Path::new(&manifest_dir).join("assets/pglite_npm/dist/pgdata_seed.tar");
-    if seed_path.exists() {
-        println!("cargo:warning=pgdata_seed.tar already exists");
+fn ensure_npm_assets() {
+    let dist_dir = Path::new("assets/pglite_npm/dist");
+    let index_path = dist_dir.join("index.js");
+    if index_path.exists() {
         return;
     }
 
-    println!("cargo:warning=Generating pgdata_seed.tar for faster startup...");
-
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-
-    let binary_name = if cfg!(windows) {
-        "pglited.exe"
-    } else {
-        "pglited"
-    };
-    let binary_path = Path::new(&target_dir).join(&profile).join(binary_name);
-
-    if !binary_path.exists() {
-        println!(
-            "cargo:warning=pglited binary not found at {:?}, skipping pgdata_seed generation",
-            binary_path
-        );
-        println!("cargo:warning=Build once, then rebuild to generate pgdata_seed");
-        return;
-    }
+    fs::create_dir_all(dist_dir).expect("Failed to create npm assets directory");
 
     println!(
-        "cargo:warning=Using pglited binary at {:?} to generate seed",
-        binary_path
+        "cargo:warning=Downloading pglite npm assets ({})...",
+        PGLITE_VERSION
     );
 
-    let dist_dir = Path::new(&manifest_dir).join("assets/pglite_npm/dist");
-    let extensions = collect_seed_extensions(&dist_dir);
+    fetch_and_unpack(
+        &npm_tarball_url("pglite", PGLITE_VERSION),
+        "package/dist",
+        dist_dir,
+    );
+}
 
-    let mut command = Command::new(&binary_path);
-    command
-        .arg("--dump-datadir")
-        .arg(&seed_path)
-        .current_dir(&manifest_dir);
-    if !extensions.is_empty() {
-        command.arg("--extensions").arg(extensions.join(","));
-    }
+fn ensure_extension_packages() {
+    let dist_dir = Path::new("assets/pglite_npm/dist");
 
-    match command.output() {
-        Ok(output) => {
-            if output.status.success() {
-                if seed_path.exists() {
-                    let size = fs::metadata(seed_path)
-                        .map(|m| m.len() as f64 / 1024.0 / 1024.0)
-                        .unwrap_or(0.0);
-                    println!("cargo:warning=Generated pgdata_seed.tar ({:.2} MB)", size);
-                } else {
-                    println!("cargo:warning=pgdata_seed generation completed but file not found");
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                println!(
-                    "cargo:warning=pgdata_seed generation failed (optional): {}",
-                    stderr.lines().next().unwrap_or("unknown error")
-                );
-            }
+    for (name, package, version) in EXTENSION_PACKAGES {
+        let ext_dir = dist_dir.join(name);
+        if ext_dir.join("index.js").exists() {
+            continue;
         }
-        Err(e) => {
-            println!("cargo:warning=Failed to run pglited binary: {}", e);
-            println!("cargo:warning=Build once, then rebuild to generate pgdata_seed");
-        }
+
+        println!(
+            "cargo:warning=Downloading extension {} ({}@{})...",
+            name, package, version
+        );
+        fs::create_dir_all(&ext_dir).expect("Failed to create extension directory");
+        fetch_and_unpack(&npm_tarball_url(package, version), "package/dist", &ext_dir);
     }
 }
 
-fn collect_seed_extensions(dist_dir: &Path) -> Vec<String> {
-    let mut extensions = Vec::new();
+fn report_pgdata_seed() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let seed_path = Path::new(&manifest_dir).join("assets/pglite_npm/dist/pgdata_seed.tar");
 
-    let contrib_dir = dist_dir.join("contrib");
-    if contrib_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&contrib_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
-                    continue;
-                }
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(".js") && !name.ends_with(".js.map") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            extensions.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-        }
+    if seed_path.exists() {
+        return;
     }
 
-    let top_level = [
-        "vector",
-        "pg_ivm",
-        "pg_hashids",
-        "pg_uuidv7",
-        "pgtap",
-        "live",
-    ];
-    for name in top_level {
-        let candidate = dist_dir.join(name).join("index.js");
-        if candidate.exists() {
-            extensions.push(name.to_string());
-        }
-    }
-
-    extensions.sort();
-    extensions.dedup();
-    extensions
+    println!("cargo:warning=pgdata_seed.tar is missing; file:// databases will fall back to a slow initdb");
+    println!("cargo:warning=Generate it with: mise run seed");
 }

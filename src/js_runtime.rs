@@ -6,6 +6,7 @@ use deno_core::{
 };
 use deno_error::JsErrorBox;
 use flate2::read::GzDecoder;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use rust_embed::Embed;
 use serde::de::DeserializeOwned;
@@ -14,16 +15,22 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-fn debug_enabled() -> bool {
+static DEBUG_ENABLED: Lazy<bool> = Lazy::new(|| {
     std::env::var("PGLITE_DEBUG")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+});
+
+#[inline]
+fn debug_enabled() -> bool {
+    *DEBUG_ENABLED
 }
 
 fn debug_log(message: &str) {
@@ -35,6 +42,75 @@ fn debug_log(message: &str) {
 // File descriptor table for managing open files
 thread_local! {
     static FD_TABLE: RefCell<FdTable> = RefCell::new(FdTable::new());
+
+    /// Directory the filesystem ops are confined to. Thread-local because each
+    /// `PgliteRuntime` owns one JS thread with its own data directory.
+    static FS_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// The `op_fs_*` ops bridge JS/WASM straight to the host filesystem. PGlite
+/// should only ever touch its own data directory; anything else is denied.
+///
+/// Set `PGLITED_FS_SANDBOX=0` to opt out.
+static FS_SANDBOX_ENABLED: Lazy<bool> = Lazy::new(|| {
+    std::env::var("PGLITED_FS_SANDBOX")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+});
+
+fn set_fs_root(root: Option<PathBuf>) {
+    FS_ROOT.with(|cell| *cell.borrow_mut() = root);
+}
+
+/// Resolve `.`/`..` without touching the filesystem: the target often does not
+/// exist yet, so `canonicalize` is not an option.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Lexical check only: it stops path traversal, not a symlink planted inside
+/// the data directory by someone who can already write there.
+fn guard_path(path: &str) -> std::io::Result<()> {
+    if !*FS_SANDBOX_ENABLED {
+        return Ok(());
+    }
+
+    FS_ROOT.with(|cell| {
+        let borrowed = cell.borrow();
+        let Some(root) = borrowed.as_ref() else {
+            return Ok(());
+        };
+
+        let candidate = Path::new(path);
+        let absolute = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            root.join(candidate)
+        };
+
+        if lexically_normalize(&absolute).starts_with(root) {
+            Ok(())
+        } else {
+            debug_log(&format!(
+                "Blocked filesystem access outside data dir: {}",
+                path
+            ));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("Path outside the pglited data directory: {}", path),
+            ))
+        }
+    })
 }
 
 struct FdTable {
@@ -94,6 +170,44 @@ fn extract_value<T: DeserializeOwned>(
     deno_core::scope!(scope, runtime);
     let local = v8::Local::new(scope, global);
     serde_v8::from_v8(scope, local).context("Failed to deserialize V8 value")
+}
+
+fn read_global_bool(runtime: &mut JsRuntime, name: &str) -> bool {
+    deno_core::scope!(scope, runtime);
+    let global = scope.get_current_context().global(scope);
+    let Some(key) = v8::String::new(scope, name) else {
+        return false;
+    };
+    global
+        .get(scope, key.into())
+        .map(|value| value.is_true())
+        .unwrap_or(false)
+}
+
+/// Drives the event loop until the script sets `done_flag`, or the deadline
+/// passes. Returns whether the flag was set.
+///
+/// Timers are unrefed so PostgreSQL's repeating `setitimer` alarms cannot keep
+/// the loop alive forever, which also means the loop can go idle while work is
+/// still outstanding - hence the polling.
+async fn pump_until(runtime: &mut JsRuntime, done_flag: &str, timeout: Duration) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        runtime
+            .run_event_loop(PollEventLoopOptions::default())
+            .await?;
+
+        if read_global_bool(runtime, done_flag) {
+            return Ok(true);
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 pub struct PgliteRuntime {
@@ -173,9 +287,15 @@ impl WireProcessor for PgliteRuntime {
         self.sender
             .send(JsRequest::Exec(data.to_vec(), response_tx))
             .map_err(|_| anyhow::anyhow!("Runtime channel closed"))?;
-        response_rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|_| anyhow::anyhow!("Runtime response timeout"))?
+
+        match crate::query_timeout() {
+            Some(timeout) => response_rx
+                .recv_timeout(timeout)
+                .map_err(|_| anyhow::anyhow!("Runtime response timeout"))?,
+            None => response_rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("Runtime channel closed"))?,
+        }
     }
 }
 
@@ -233,6 +353,16 @@ fn get_embedded_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
 fn get_js_shim_asset(name: &str) -> Option<String> {
     JsShimAssets::get(name).and_then(|f| std::str::from_utf8(&f.data).ok().map(|s| s.to_string()))
 }
+
+// Compiled once: these run over the whole multi-megabyte PGlite bundle.
+static FS_REQUIRE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"require\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap());
+static PATH_REQUIRE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"require\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap());
+static ALIASED_FS_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap());
+static ALIASED_PATH_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap());
 
 struct EmbeddedModuleLoader;
 
@@ -361,33 +491,29 @@ impl ModuleLoader for EmbeddedModuleLoader {
         let code = if asset_path == "index.js" {
             // Use regex to match various forms of require for fs and path
             // This handles minified code where spacing may vary
-            let mut patched = code.clone();
+            let mut patched = code;
 
             // Match require("fs"), require('fs'), require( "fs" ), etc.
             // Also handles node:fs variants
-            let fs_regex = Regex::new(r#"require\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap();
-            patched = fs_regex.replace_all(&patched, "globalThis.fs").to_string();
+            patched = FS_REQUIRE_RE
+                .replace_all(&patched, "globalThis.fs")
+                .into_owned();
 
             // Match require("path"), require('path'), etc.
-            let path_regex = Regex::new(r#"require\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap();
-            patched = path_regex
+            patched = PATH_REQUIRE_RE
                 .replace_all(&patched, "globalThis.path")
-                .to_string();
+                .into_owned();
 
             // Also handle the case where a function is aliased and called with fs/path
             // e.g., n("fs") where n is a renamed require
             // Look for patterns like: =n("fs") or (n("fs") or ,n("fs")
-            let aliased_fs_regex =
-                Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?fs["']\s*\)"#).unwrap();
-            patched = aliased_fs_regex
+            patched = ALIASED_FS_RE
                 .replace_all(&patched, "${1}globalThis.fs")
-                .to_string();
+                .into_owned();
 
-            let aliased_path_regex =
-                Regex::new(r#"([=\(,])(\w+)\s*\(\s*["'](?:node:)?path["']\s*\)"#).unwrap();
-            patched = aliased_path_regex
+            patched = ALIASED_PATH_RE
                 .replace_all(&patched, "${1}globalThis.path")
-                .to_string();
+                .into_owned();
 
             // Also ensure process is available
             let process_injection = r#"
@@ -419,6 +545,51 @@ if (typeof process === 'undefined') {
     }
 }
 
+fn env_secs(name: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(default),
+    )
+}
+
+fn init_timeout() -> Duration {
+    env_secs("PGLITED_INIT_TIMEOUT_SECS", 120)
+}
+
+fn sql_timeout() -> Duration {
+    env_secs("PGLITED_INIT_SQL_TIMEOUT_SECS", 60)
+}
+
+fn dump_timeout() -> Duration {
+    env_secs("PGLITED_DUMP_TIMEOUT_SECS", 300)
+}
+
+/// PGlite's own debug level (0-5). At 5 PostgreSQL's server log is echoed to
+/// stderr, which is the only way to see why a data directory refuses to start.
+fn pglite_debug_level() -> u8 {
+    std::env::var("PGLITE_DEBUG_LEVEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .unwrap_or(0)
+        .min(5)
+}
+
+fn env_mb(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(default)
+}
+
+/// Render `value` as a JS string literal (quotes included).
+fn js_string(value: &str) -> String {
+    serde_json::Value::String(value.to_string()).to_string()
+}
+
 fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut decoder = GzDecoder::new(data);
     let mut decompressed = Vec::new();
@@ -431,18 +602,16 @@ fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 fn op_read_file(#[string] path: String) -> std::result::Result<Vec<u8>, std::io::Error> {
     get_embedded_asset(&path)
         .map(|data| {
-            let vec = data.to_vec();
-
             // Auto-decompress .tar.gz files so PGlite can read them directly
-            // (PGlite tries to use DecompressionStream which we don't have)
+            // (PGlite tries to use DecompressionStream which we don't have).
             if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
-                if let Ok(decompressed) = decompress_gzip(&vec) {
+                if let Ok(decompressed) = decompress_gzip(&data) {
                     return decompressed;
                 }
                 // Fall back to returning raw data on decompression error
             }
 
-            vec
+            data.into_owned()
         })
         .ok_or_else(|| {
             debug_log(&format!("Embedded asset not found: {}", path));
@@ -459,10 +628,12 @@ fn op_exec_wire(#[buffer] payload: &[u8]) -> std::result::Result<Vec<u8>, std::i
     Ok(payload.to_vec())
 }
 
-// Filesystem ops for Node.js fs module compatibility
+// Filesystem ops for Node.js fs module compatibility.
+// Every path-taking op runs through `guard_path`.
 #[deno_core::op2]
 #[buffer]
 fn op_fs_read_file_sync(#[string] path: String) -> std::result::Result<Vec<u8>, std::io::Error> {
+    guard_path(&path)?;
     std::fs::read(&path)
 }
 
@@ -471,6 +642,7 @@ fn op_fs_write_file_sync(
     #[string] path: String,
     #[buffer] data: &[u8],
 ) -> std::result::Result<(), std::io::Error> {
+    guard_path(&path)?;
     std::fs::write(&path, data)
 }
 
@@ -479,6 +651,7 @@ fn op_fs_mkdir_sync(
     #[string] path: String,
     recursive: bool,
 ) -> std::result::Result<(), std::io::Error> {
+    guard_path(&path)?;
     if recursive {
         std::fs::create_dir_all(&path)
     } else {
@@ -488,22 +661,25 @@ fn op_fs_mkdir_sync(
 
 #[deno_core::op2(fast)]
 fn op_fs_exists_sync(#[string] path: String) -> bool {
-    std::path::Path::new(&path).exists()
+    guard_path(&path).is_ok() && std::path::Path::new(&path).exists()
 }
 
 #[deno_core::op2(fast)]
 fn op_fs_unlink_sync(#[string] path: String) -> std::result::Result<(), std::io::Error> {
+    guard_path(&path)?;
     std::fs::remove_file(&path)
 }
 
 #[deno_core::op2(fast)]
 fn op_fs_rmdir_sync(#[string] path: String) -> std::result::Result<(), std::io::Error> {
+    guard_path(&path)?;
     std::fs::remove_dir(&path)
 }
 
 #[deno_core::op2]
 #[serde]
 fn op_fs_stat_sync(#[string] path: String) -> std::result::Result<FsStat, std::io::Error> {
+    guard_path(&path)?;
     let metadata = std::fs::metadata(&path)?;
     Ok(FsStat::from_metadata(&metadata))
 }
@@ -511,6 +687,7 @@ fn op_fs_stat_sync(#[string] path: String) -> std::result::Result<FsStat, std::i
 #[deno_core::op2]
 #[serde]
 fn op_fs_lstat_sync(#[string] path: String) -> std::result::Result<FsStat, std::io::Error> {
+    guard_path(&path)?;
     let metadata = std::fs::symlink_metadata(&path)?;
     Ok(FsStat::from_metadata(&metadata))
 }
@@ -518,8 +695,9 @@ fn op_fs_lstat_sync(#[string] path: String) -> std::result::Result<FsStat, std::
 #[deno_core::op2]
 #[serde]
 fn op_fs_readdir_sync(#[string] path: String) -> std::result::Result<Vec<String>, std::io::Error> {
+    guard_path(&path)?;
     let entries = std::fs::read_dir(&path)?;
-    let mut names = Vec::new();
+    let mut names = Vec::with_capacity(32);
     for entry in entries {
         let entry = entry?;
         if let Some(name) = entry.file_name().to_str() {
@@ -534,6 +712,8 @@ fn op_fs_rename_sync(
     #[string] old_path: String,
     #[string] new_path: String,
 ) -> std::result::Result<(), std::io::Error> {
+    guard_path(&old_path)?;
+    guard_path(&new_path)?;
     std::fs::rename(&old_path, &new_path)
 }
 
@@ -542,6 +722,7 @@ fn op_fs_truncate_sync(
     #[string] path: String,
     #[bigint] len: u64,
 ) -> std::result::Result<(), std::io::Error> {
+    guard_path(&path)?;
     let file = std::fs::OpenOptions::new().write(true).open(&path)?;
     file.set_len(len)
 }
@@ -553,6 +734,7 @@ fn op_fs_open_sync(
     #[string] flags: String,
     mode: u32,
 ) -> std::result::Result<u32, std::io::Error> {
+    guard_path(&path)?;
     let mut opts = std::fs::OpenOptions::new();
 
     // Parse flags string (Node.js style: 'r', 'r+', 'w', 'w+', 'a', 'a+', etc.)
@@ -765,10 +947,17 @@ extension!(
     ],
 );
 
-fn build_extensions_loader_js(extensions: &[String]) -> String {
+fn build_extensions_loader_js(extensions: &[String]) -> Result<String> {
+    // Also validated at the CLI boundary; re-checked here for any other caller.
+    for name in extensions {
+        crate::validate_extension_name(name)?;
+    }
+
     if extensions.is_empty() {
-        return "const __pgliteRequestedExtensions = [];\nconst __pgliteExtensions = undefined;"
-            .to_string();
+        return Ok(
+            "const __pgliteRequestedExtensions = [];\nconst __pgliteExtensions = undefined;"
+                .to_string(),
+        );
     }
 
     let mut specs = serde_json::Map::new();
@@ -800,7 +989,7 @@ fn build_extensions_loader_js(extensions: &[String]) -> String {
     let specs_json = serde_json::Value::Object(specs).to_string();
     let requested_json = serde_json::to_string(extensions).unwrap_or_else(|_| "[]".to_string());
 
-    format!(
+    Ok(format!(
         r#"
         const __pgliteExtensionSpecs = {};
         const __pgliteRequestedExtensions = {};
@@ -826,7 +1015,7 @@ fn build_extensions_loader_js(extensions: &[String]) -> String {
         }}
         "#,
         specs_json, requested_json
-    )
+    ))
 }
 
 fn run_js_runtime(
@@ -851,10 +1040,12 @@ fn run_js_runtime(
     };
 
     let result = tokio_rt.block_on(async {
-        // Configure V8 heap to avoid GC during startup and query processing
-        // Initial: 256MB, Max: 1GB
+        // Configure V8 heap to avoid GC during startup and query processing.
+        // Override with PGLITED_V8_HEAP_MB / PGLITED_V8_MAX_HEAP_MB.
+        let initial_heap_mb = env_mb("PGLITED_V8_HEAP_MB", 256);
+        let max_heap_mb = env_mb("PGLITED_V8_MAX_HEAP_MB", 1024).max(initial_heap_mb);
         let create_params = v8::Isolate::create_params()
-            .heap_limits(256 * 1024 * 1024, 1024 * 1024 * 1024);
+            .heap_limits(initial_heap_mb * 1024 * 1024, max_heap_mb * 1024 * 1024);
 
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![pglite_ext::init()],
@@ -872,7 +1063,9 @@ fn run_js_runtime(
             r#"
             // Debug logging (defined early so polyfills can use it)
             const __pgliteDebugEnabled = {debug_enabled};
+            const __pgliteDebugLevel = {debug_level};
             globalThis.__pgliteDebug = __pgliteDebugEnabled;
+            globalThis.__pgliteDebugLevel = __pgliteDebugLevel;
             const debugLog = (...args) => {{
                 if (__pgliteDebugEnabled) {{
                     console.log(...args);
@@ -1036,52 +1229,45 @@ fn run_js_runtime(
                 }};
             }}
 
-            // Timer polyfills
+            // Timer polyfills backed by deno_core's native timers. A
+            // queueMicrotask spin would burn a core and starve the event loop:
+            // Emscripten's __setitimer_js arms multi-second alarms for
+            // PostgreSQL. Timers are unrefed so a repeating alarm cannot keep
+            // run_event_loop() alive forever; see pump_until.
             if (typeof setTimeout === 'undefined') {{
+                const core = Deno.core;
+                const timers = new Map();
                 let timerId = 0;
-                const pendingTimers = new Map();
 
-                globalThis.setTimeout = (fn, delay = 0, ...args) => {{
+                const schedule = (fn, delay, args, repeat) => {{
+                    if (typeof fn !== 'function') return 0;
                     const id = ++timerId;
-                    if (delay <= 0) {{
-                        queueMicrotask(() => {{
-                            if (pendingTimers.has(id)) {{
-                                pendingTimers.delete(id);
-                                fn(...args);
-                            }}
-                        }});
-                    }} else {{
-                        const start = Date.now();
-                        const check = () => {{
-                            if (!pendingTimers.has(id)) return;
-                            if (Date.now() - start >= delay) {{
-                                pendingTimers.delete(id);
-                                fn(...args);
-                            }} else {{
-                                queueMicrotask(check);
-                            }}
-                        }};
-                        queueMicrotask(check);
-                    }}
-                    pendingTimers.set(id, true);
+                    const handle = core.createTimer(
+                        () => {{
+                            if (!repeat) timers.delete(id);
+                            fn(...args);
+                        }},
+                        delay > 0 ? delay : 1,
+                        undefined,
+                        repeat,
+                        false,
+                        false,
+                    );
+                    timers.set(id, handle);
                     return id;
                 }};
 
-                globalThis.clearTimeout = (id) => pendingTimers.delete(id);
-
-                globalThis.setInterval = (fn, delay = 0, ...args) => {{
-                    const id = ++timerId;
-                    pendingTimers.set(id, true);
-                    const run = () => {{
-                        if (!pendingTimers.has(id)) return;
-                        fn(...args);
-                        setTimeout(run, delay);
-                    }};
-                    setTimeout(run, delay);
-                    return id;
+                const cancel = (id) => {{
+                    const handle = timers.get(id);
+                    if (handle === undefined) return;
+                    timers.delete(id);
+                    core.cancelTimer(handle);
                 }};
 
-                globalThis.clearInterval = (id) => pendingTimers.delete(id);
+                globalThis.setTimeout = (fn, delay = 0, ...args) => schedule(fn, delay, args, false);
+                globalThis.setInterval = (fn, delay = 0, ...args) => schedule(fn, delay, args, true);
+                globalThis.clearTimeout = cancel;
+                globalThis.clearInterval = cancel;
             }}
 
             // URL polyfill
@@ -1522,7 +1708,7 @@ fn run_js_runtime(
             globalThis.module = {{ exports: {{}} }};
             globalThis.exports = globalThis.module.exports;
 
-            globalThis.__pgliteDataDir = "{}";
+            globalThis.__pgliteDataDir = {};
 
             globalThis.__pgliteReadFile = (path) => {{
                 return Deno.core.ops.op_read_file(String(path));
@@ -1566,9 +1752,15 @@ fn run_js_runtime(
                 if (buffer instanceof ArrayBuffer) {{
                     arrayBuffer = buffer;
                 }} else if (buffer && buffer.buffer instanceof ArrayBuffer) {{
-                    const copy = new ArrayBuffer(buffer.byteLength);
-                    new Uint8Array(copy).set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
-                    arrayBuffer = copy;
+                    // The op hands back a buffer we exclusively own, so adopt
+                    // it rather than copying tens of megabytes.
+                    if (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength) {{
+                        arrayBuffer = buffer.buffer;
+                    }} else {{
+                        const copy = new ArrayBuffer(buffer.byteLength);
+                        new Uint8Array(copy).set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
+                        arrayBuffer = copy;
+                    }}
                 }} else if (buffer && typeof buffer.length === 'number') {{
                     const copy = new ArrayBuffer(buffer.length);
                     const view = new Uint8Array(copy);
@@ -1623,9 +1815,11 @@ fn run_js_runtime(
 
             globalThis.__pgliteIsReady = false;
             globalThis.__pgliteInitError = undefined;
+            globalThis.__pgliteInitSettled = false;
             "#,
-            data_dir_str.replace('\\', "\\\\").replace('"', "\\\""),
+            js_string(&data_dir_str),
             debug_enabled = debug_enabled,
+            debug_level = pglite_debug_level(),
         );
 
         runtime
@@ -1656,7 +1850,12 @@ fn run_js_runtime(
             &data_dir_str
         };
 
-        let extensions_loader = build_extensions_loader_js(&extensions);
+        if use_custom_fs {
+            // Confine the filesystem ops before any JS can call them.
+            set_fs_root(Some(lexically_normalize(&std::path::absolute(actual_path)?)));
+        }
+
+        let extensions_loader = build_extensions_loader_js(&extensions)?;
         let init_code = if use_custom_fs {
             format!(
                 r#"
@@ -1669,7 +1868,7 @@ fn run_js_runtime(
                         globalThis.__pgliteExtensionNames = __pgliteRequestedExtensions;
 
                         const {{ ops }} = Deno.core;
-                        const dataDir = "{}";
+                        const dataDir = {};
 
                         if (!ops.op_fs_exists_sync(dataDir)) {{
                             ops.op_fs_mkdir_sync(dataDir, true);
@@ -1682,22 +1881,27 @@ fn run_js_runtime(
                         const dbExists = ops.op_fs_exists_sync(pgVersionPath);
 
                         if (!dbExists) {{
-                            const seedResp = await fetch('pglite:///pgdata_seed.tar');
-                            const tarData = new Uint8Array(await seedResp.arrayBuffer());
-                            extractTar(tarData, dataDir, ops);
+                            try {{
+                                const seedResp = await fetch('pglite:///pgdata_seed.tar');
+                                const tarData = new Uint8Array(await seedResp.arrayBuffer());
+                                extractTar(tarData, dataDir, ops);
+                            }} catch (seedErr) {{
+                                debugLog('[init] no pgdata seed, falling back to initdb:', String(seedErr));
+                            }}
                         }}
 
-                        const pg = await mod.PGlite.create({{ fs: customFs, extensions: __pgliteExtensions }});
+                        const pg = await mod.PGlite.create({{ fs: customFs, extensions: __pgliteExtensions, debug: __pgliteDebugLevel }});
                         globalThis.__pgliteInstance = pg;
                         globalThis.__pgliteIsReady = true;
                     }} catch (err) {{
                         globalThis.__pgliteInitError = String(err);
-                        throw err;
+                    }} finally {{
+                        globalThis.__pgliteInitSettled = true;
                     }}
                 }})();
                 "#,
                 extensions_loader,
-                actual_path.replace('\\', "\\\\").replace('"', "\\\"")
+                js_string(actual_path)
             )
         } else {
             format!(
@@ -1707,7 +1911,7 @@ fn run_js_runtime(
                         const mod = await import("pglite:///index.js");
                         {}
                         globalThis.__pgliteExtensionNames = __pgliteRequestedExtensions;
-                        const options = {{ dataDir: "{}" }};
+                        const options = {{ dataDir: {}, debug: __pgliteDebugLevel }};
                         if (__pgliteExtensions) {{
                             options.extensions = __pgliteExtensions;
                         }}
@@ -1716,12 +1920,13 @@ fn run_js_runtime(
                         globalThis.__pgliteIsReady = true;
                     }} catch (err) {{
                         globalThis.__pgliteInitError = String(err);
-                        throw err;
+                    }} finally {{
+                        globalThis.__pgliteInitSettled = true;
                     }}
                 }})();
                 "#,
                 extensions_loader,
-                data_dir_str.replace('\\', "\\\\").replace('"', "\\\"")
+                js_string(&data_dir_str)
             )
         };
 
@@ -1731,10 +1936,12 @@ fn run_js_runtime(
 
         debug_log("Init script executed");
 
-        // Run the event loop to completion - this processes all async work including
-        // dynamic imports used by extensions. The run_event_loop() call will return
-        // when all promises have settled (either resolved or rejected).
-        runtime.run_event_loop(PollEventLoopOptions::default()).await?;
+        if !pump_until(&mut runtime, "__pgliteInitSettled", init_timeout()).await? {
+            return Err(anyhow::anyhow!(
+                "PGlite initialization did not finish within {:?}",
+                init_timeout()
+            ));
+        }
 
         debug_log("Init event loop finished");
 
@@ -1797,16 +2004,28 @@ fn run_js_runtime(
         }
     };
 
-    // Message loop runs outside async context to avoid nested runtime issues
+    // Resolved once rather than per query.
+    let exec_fn = match resolve_exec_fn(&mut runtime) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+
+    // The message loop is synchronous to avoid nested runtime issues, but still
+    // needs a tokio context: deno_core's timers are backed by tokio's clock.
+    let _runtime_guard = tokio_rt.enter();
+
     loop {
         match receiver.recv() {
             Ok(JsRequest::Exec(payload, response_tx)) => {
-                let result = exec_wire_message(&mut runtime, payload);
+                let result = exec_wire_message(&mut runtime, &exec_fn, payload);
                 let _ = response_tx.send(result);
                 runtime.v8_isolate().perform_microtask_checkpoint();
             }
             Ok(JsRequest::ExecAsync(payload, response_tx)) => {
-                let result = exec_wire_message(&mut runtime, payload);
+                let result = exec_wire_message(&mut runtime, &exec_fn, payload);
                 let _ = response_tx.send(result);
                 runtime.v8_isolate().perform_microtask_checkpoint();
             }
@@ -1815,7 +2034,7 @@ fn run_js_runtime(
                 let _ = response_tx.send(result);
             }
             Ok(JsRequest::ExecSql(sql, response_tx)) => {
-                let result = exec_sql(&mut runtime, &sql);
+                let result = exec_sql(&mut runtime, &tokio_rt, &sql);
                 let _ = response_tx.send(result);
                 runtime.v8_isolate().perform_microtask_checkpoint();
             }
@@ -1824,8 +2043,25 @@ fn run_js_runtime(
     }
 }
 
+fn resolve_exec_fn(runtime: &mut JsRuntime) -> Result<v8::Global<v8::Function>> {
+    deno_core::scope!(scope, runtime);
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "__pgliteExec")
+        .ok_or_else(|| anyhow::anyhow!("Failed to allocate V8 string"))?;
+    let value = global
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow::anyhow!("__pgliteExec not found"))?;
+    let func = v8::Local::<v8::Function>::try_from(value)
+        .map_err(|_| anyhow::anyhow!("__pgliteExec is not a function"))?;
+    Ok(v8::Global::new(scope, func))
+}
+
 #[inline]
-fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8>> {
+fn exec_wire_message(
+    runtime: &mut JsRuntime,
+    exec_fn: &v8::Global<v8::Function>,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
     // Use V8's ArrayBuffer directly - zero-copy since we own the Vec
     let payload_len = payload.len();
     deno_core::scope!(scope, runtime);
@@ -1836,14 +2072,7 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8
     let uint8_array = v8::Uint8Array::new(scope, array_buffer, 0, payload_len)
         .ok_or_else(|| anyhow::anyhow!("Failed to create Uint8Array"))?;
 
-    // Get the exec function from global
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "__pgliteExec").unwrap();
-    let exec_fn = global
-        .get(scope, key.into())
-        .ok_or_else(|| anyhow::anyhow!("__pgliteExec not found"))?;
-    let exec_fn = v8::Local::<v8::Function>::try_from(exec_fn)
-        .map_err(|_| anyhow::anyhow!("__pgliteExec is not a function"))?;
+    let exec_fn = v8::Local::new(scope, exec_fn);
 
     // Call with the Uint8Array directly
     let undefined = v8::undefined(scope);
@@ -1885,48 +2114,47 @@ fn exec_wire_message(runtime: &mut JsRuntime, payload: Vec<u8>) -> Result<Vec<u8
     }
 }
 
-fn exec_sql(runtime: &mut JsRuntime, sql: &str) -> Result<()> {
-    // Escape the SQL for JavaScript string
-    let escaped_sql = sql
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace('$', "\\$");
-
-    let code = format!(
-        r#"
-        globalThis.__execSqlError = null;
-        globalThis.__execSqlDone = false;
-        (async () => {{
-            try {{
-                const pg = globalThis.__pgliteInstance;
-                await pg.exec(`{}`);
-                globalThis.__execSqlDone = true;
-            }} catch (e) {{
-                globalThis.__execSqlError = String(e);
-                globalThis.__execSqlDone = true;
-            }}
-        }})();
-        "#,
-        escaped_sql
-    );
+/// Runs `--init-sql` / `PGLITED_INIT_SQL`.
+///
+/// The SQL is passed as a V8 string rather than spliced into the script source:
+/// escaping user input into a template literal is a code-injection hazard.
+fn exec_sql(runtime: &mut JsRuntime, tokio_rt: &tokio::runtime::Runtime, sql: &str) -> Result<()> {
+    {
+        deno_core::scope!(scope, runtime);
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "__pgliteInitSql")
+            .ok_or_else(|| anyhow::anyhow!("Failed to allocate V8 string"))?;
+        let value = v8::String::new(scope, sql)
+            .ok_or_else(|| anyhow::anyhow!("SQL statement is too large for V8"))?;
+        global.set(scope, key.into(), value.into());
+    }
 
     runtime
-        .execute_script("<exec_sql>", code)
+        .execute_script(
+            "<exec_sql>",
+            r#"
+        globalThis.__execSqlError = null;
+        globalThis.__execSqlDone = false;
+        (async () => {
+            try {
+                const pg = globalThis.__pgliteInstance;
+                await pg.exec(globalThis.__pgliteInitSql);
+                globalThis.__execSqlDone = true;
+            } catch (e) {
+                globalThis.__execSqlError = String(e);
+                globalThis.__execSqlDone = true;
+            }
+        })();
+        "#,
+        )
         .context("Failed to start SQL execution")?;
 
-    // Run event loop to completion
-    let tokio_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create tokio runtime for exec_sql")?;
-
-    tokio_rt
-        .block_on(async {
-            runtime
-                .run_event_loop(PollEventLoopOptions::default())
-                .await
-        })
+    let finished = tokio_rt
+        .block_on(async { pump_until(runtime, "__execSqlDone", sql_timeout()).await })
         .context("Failed to run event loop for exec_sql")?;
+    if !finished {
+        return Err(anyhow::anyhow!("SQL execution timed out"));
+    }
 
     // Check for errors
     let error_global = runtime
@@ -1946,20 +2174,26 @@ fn dump_data_dir_sync(
     extensions: &[String],
 ) -> Result<Vec<u8>> {
     if !extensions.is_empty() {
+        for name in extensions {
+            crate::validate_extension_name(name)?;
+        }
+
         let install_code = format!(
             r#"
-            globalThis.__seedExtensionError = null;
+            globalThis.__seedSkipped = [];
+            globalThis.__seedExtensionsDone = false;
             (async () => {{
-                try {{
-                    const pg = globalThis.__pgliteInstance;
-                    const names = {};
-                    for (const name of names) {{
-                        if (name === 'live') continue;
+                const pg = globalThis.__pgliteInstance;
+                const names = {};
+                for (const name of names) {{
+                    if (name === 'live') continue;
+                    try {{
                         await pg.exec(`CREATE EXTENSION IF NOT EXISTS "${{name}}"`);
+                    }} catch (e) {{
+                        globalThis.__seedSkipped.push(name + ': ' + String(e));
                     }}
-                }} catch (e) {{
-                    globalThis.__seedExtensionError = String(e);
                 }}
+                globalThis.__seedExtensionsDone = true;
             }})();
             "#,
             serde_json::to_string(extensions).unwrap_or_else(|_| "[]".to_string())
@@ -1968,14 +2202,16 @@ fn dump_data_dir_sync(
             .execute_script("<seed_extensions>", install_code)
             .context("Failed to start extension install")?;
 
-        tokio_rt.block_on(async { runtime.run_event_loop(Default::default()).await })?;
+        tokio_rt.block_on(async {
+            pump_until(runtime, "__seedExtensionsDone", dump_timeout()).await
+        })?;
 
-        let error_global = runtime
-            .execute_script("<seed_extensions_error>", "globalThis.__seedExtensionError")
-            .context("Failed to check extension install error")?;
-        let error: Option<String> = extract_value(runtime, error_global)?;
-        if let Some(e) = error {
-            return Err(anyhow::anyhow!("Extension install error: {}", e));
+        let skipped_global = runtime
+            .execute_script("<seed_extensions_skipped>", "globalThis.__seedSkipped")
+            .context("Failed to read extension install results")?;
+        let skipped: Vec<String> = extract_value(runtime, skipped_global)?;
+        for entry in &skipped {
+            debug_log(&format!("Skipped extension during seed: {}", entry));
         }
     }
 
@@ -2004,8 +2240,11 @@ fn dump_data_dir_sync(
         )
         .context("Failed to start dump")?;
 
-    // Use tokio runtime to properly run the event loop for async operations
-    tokio_rt.block_on(async { runtime.run_event_loop(Default::default()).await })?;
+    let finished =
+        tokio_rt.block_on(async { pump_until(runtime, "__dumpDone", dump_timeout()).await })?;
+    if !finished {
+        return Err(anyhow::anyhow!("Data directory dump timed out"));
+    }
 
     let error_global = runtime
         .execute_script("<dump_error>", "globalThis.__dumpError")
@@ -2054,18 +2293,19 @@ fn normalize_data_dir(data_dir: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_extensions_loader_js, normalize_asset_path};
+    use super::*;
 
     #[test]
     fn build_extensions_loader_js_empty() {
-        let code = build_extensions_loader_js(&[]);
+        let code = build_extensions_loader_js(&[]).unwrap();
 
         assert!(code.contains("const __pgliteExtensions = undefined"));
     }
 
     #[test]
     fn build_extensions_loader_js_includes_requested() {
-        let code = build_extensions_loader_js(&["pg_trgm".to_string(), "vector".to_string()]);
+        let code =
+            build_extensions_loader_js(&["pg_trgm".to_string(), "vector".to_string()]).unwrap();
 
         assert!(code.contains("\"pg_trgm\""));
         assert!(code.contains("\"vector\""));
@@ -2074,9 +2314,63 @@ mod tests {
     }
 
     #[test]
+    fn build_extensions_loader_js_rejects_unsafe_names() {
+        assert!(build_extensions_loader_js(&["../../../etc/passwd".to_string()]).is_err());
+        assert!(build_extensions_loader_js(&["x`; globalThis.pwned = 1; //".to_string()]).is_err());
+    }
+
+    #[test]
     fn normalize_asset_path_resolves_dot_segments() {
         let path = normalize_asset_path("contrib/../pg_trgm.tar.gz");
 
         assert_eq!(path, "pg_trgm.tar.gz");
+    }
+
+    #[test]
+    fn js_string_escapes_quotes_and_control_characters() {
+        assert_eq!(js_string("plain"), "\"plain\"");
+        assert_eq!(js_string("a\"b"), "\"a\\\"b\"");
+        assert_eq!(js_string("a\nb"), "\"a\\nb\"");
+        assert_eq!(js_string("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn lexically_normalize_removes_dot_segments() {
+        assert_eq!(
+            lexically_normalize(Path::new("/data/pg/../pg/base/./1")),
+            PathBuf::from("/data/pg/base/1")
+        );
+    }
+
+    #[test]
+    fn guard_path_allows_paths_inside_the_root() {
+        set_fs_root(Some(PathBuf::from("/data/pg")));
+
+        assert!(guard_path("/data/pg/base/1").is_ok());
+        assert!(guard_path("/data/pg").is_ok());
+        // Relative paths resolve against the root.
+        assert!(guard_path("base/1").is_ok());
+
+        set_fs_root(None);
+    }
+
+    #[test]
+    fn guard_path_blocks_escapes_from_the_root() {
+        set_fs_root(Some(PathBuf::from("/data/pg")));
+
+        assert!(guard_path("/etc/passwd").is_err());
+        assert!(guard_path("/data/pg/../../etc/passwd").is_err());
+        assert!(guard_path("../../etc/passwd").is_err());
+        // A sibling directory that merely shares a name prefix.
+        assert!(guard_path("/data/pg-other/secret").is_err());
+
+        set_fs_root(None);
+    }
+
+    #[test]
+    fn guard_path_is_permissive_without_a_root() {
+        set_fs_root(None);
+
+        assert!(guard_path("/etc/passwd").is_ok());
     }
 }

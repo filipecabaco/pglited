@@ -11,18 +11,18 @@
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
-use pglited::{AsyncPgliteExecutor, PgliteConfig, PgliteRuntime};
+use pglited::{
+    AsyncPgliteExecutor, ConnectionLimiter, PgliteConfig, PgliteRuntime, MAX_CONNECTIONS, SHUTDOWN,
+    SHUTDOWN_NOTIFY,
+};
 use serde_json::json;
 use std::env;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 static DEBUG_ENABLED: Lazy<bool> = Lazy::new(|| {
     env::var("PGLITE_DEBUG")
@@ -72,7 +72,7 @@ impl Command {
                 match args[i].as_str() {
                     "--extensions" => {
                         if i + 1 < args.len() {
-                            extensions = Some(parse_extensions(&args[i + 1]));
+                            extensions = Some(parse_extensions(&args[i + 1])?);
                             i += 2;
                         } else {
                             eprintln!("Error: --extensions requires a comma-separated list");
@@ -91,11 +91,17 @@ impl Command {
             }
 
             let env_extensions = env::var("PGLITED_EXTENSIONS").ok();
-            let extensions = extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
+            let extensions = match extensions {
+                Some(list) => list,
+                None => match env_extensions.as_deref() {
+                    Some(value) => parse_extensions(value)?,
+                    None => Vec::new(),
+                },
+            };
 
             return Ok(Command::DumpDataDir {
                 output_path,
-                extensions: extensions.unwrap_or_default(),
+                extensions,
             });
         }
 
@@ -131,7 +137,7 @@ impl Command {
                 }
                 "--extensions" => {
                     if i + 1 < args.len() {
-                        extensions = Some(parse_extensions(&args[i + 1]));
+                        extensions = Some(parse_extensions(&args[i + 1])?);
                         i += 2;
                     } else {
                         eprintln!("Error: --extensions requires a comma-separated list");
@@ -159,7 +165,13 @@ impl Command {
         }
 
         let env_extensions = env::var("PGLITED_EXTENSIONS").ok();
-        let extensions = extensions.or_else(|| env_extensions.as_deref().map(parse_extensions));
+        let extensions = match extensions {
+            Some(list) => list,
+            None => match env_extensions.as_deref() {
+                Some(value) => parse_extensions(value)?,
+                None => Vec::new(),
+            },
+        };
 
         let env_init_sql = env::var("PGLITED_INIT_SQL").ok();
         let init_sql = init_sql.or(env_init_sql);
@@ -169,7 +181,7 @@ impl Command {
             tcp_port,
             multiplexer_mode,
             daemon,
-            extensions: extensions.unwrap_or_default(),
+            extensions,
             init_sql,
         }))
     }
@@ -212,13 +224,19 @@ impl Command {
     }
 }
 
-fn parse_extensions(value: &str) -> Vec<String> {
-    value
+fn parse_extensions(value: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = value
         .split(',')
         .map(|item| item.trim())
         .filter(|item| !item.is_empty())
         .map(|item| item.to_string())
-        .collect()
+        .collect();
+
+    for name in &names {
+        pglited::validate_extension_name(name)?;
+    }
+
+    Ok(names)
 }
 
 impl ServeArgs {
@@ -231,12 +249,14 @@ impl ServeArgs {
     }
 }
 
-fn setup_signal_handlers() {
+/// Watch stdin so the process exits when its parent does. `wake_port` lets the
+/// watcher unblock a thread parked in `accept()`.
+fn setup_signal_handlers(wake_port: u16) {
     #[cfg(unix)]
     {
         use std::io::Read;
 
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 1];
 
@@ -244,12 +264,12 @@ fn setup_signal_handlers() {
                 match stdin.read(&mut buf) {
                     Ok(0) => {
                         debug_log!("[SIGNAL] stdin closed (parent died), shutting down");
-                        SHUTDOWN.store(true, Ordering::SeqCst);
+                        pglited::request_shutdown(wake_port);
                         break;
                     }
                     Err(_) => {
                         debug_log!("[SIGNAL] stdin error, shutting down");
-                        SHUTDOWN.store(true, Ordering::SeqCst);
+                        pglited::request_shutdown(wake_port);
                         break;
                     }
                     _ => {}
@@ -258,6 +278,39 @@ fn setup_signal_handlers() {
         });
     }
 }
+
+/// Shut down cleanly on SIGINT/SIGTERM rather than being killed mid-write.
+#[cfg(unix)]
+fn spawn_termination_watcher(wake_port: u16) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async move {
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                debug_log!("[SIGNAL] Failed to install SIGTERM handler: {}", e);
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                debug_log!("[SIGNAL] Failed to install SIGINT handler: {}", e);
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = sigterm.recv() => debug_log!("[SIGNAL] SIGTERM received"),
+            _ = sigint.recv() => debug_log!("[SIGNAL] SIGINT received"),
+        }
+
+        pglited::request_shutdown(wake_port);
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_termination_watcher(_wake_port: u16) {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -278,9 +331,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    let wake_port = match command {
+        Command::Serve(ServeArgs { tcp_port, .. }) => tcp_port,
+        _ => 0,
+    };
+
     if !matches!(command, Command::Serve(ServeArgs { daemon: true, .. })) {
-        setup_signal_handlers();
+        setup_signal_handlers(wake_port);
     }
+    spawn_termination_watcher(wake_port);
 
     match command {
         Command::DumpDataDir {
@@ -401,12 +460,13 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     debug_log!("\n=== Step 3: Binding TCP Socket ===");
     debug_log!("  Binding to 127.0.0.1:{}", tcp_port);
 
+    let limiter = ConnectionLimiter::new(*MAX_CONNECTIONS);
+    debug_log!("  Max connections: {}", limiter.max());
+
     if daemon {
+        // Blocking accept; shutdown unblocks it by dialing the listener.
         let listener =
             TcpListener::bind(("127.0.0.1", tcp_port)).context("Failed to bind TCP listener")?;
-        listener
-            .set_nonblocking(true)
-            .context("Failed to configure TCP listener")?;
         debug_log!("✓ TCP listener bound to 127.0.0.1:{}", tcp_port);
 
         let ready_json = if let Some(ref mode) = multiplexer_mode {
@@ -421,32 +481,39 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         debug_log!("\n=== Step 5: Accepting Connections (Threaded) ===");
 
         loop {
+            let (mut stream, addr) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    debug_log!("Accept error: {:?}", e);
+                    if SHUTDOWN.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
             if SHUTDOWN.load(Ordering::SeqCst) {
                 debug_log!("[SHUTDOWN] Received shutdown signal, exiting accept loop");
                 break;
             }
 
-            match listener.accept() {
-                Ok((stream, addr)) => {
-                    debug_log!("New connection from {:?}", addr);
+            let Some(permit) = limiter.try_acquire() else {
+                debug_log!("Rejecting {:?}: connection limit reached", addr);
+                let _ = stream.write_all(&pglited::too_many_clients_response());
+                continue;
+            };
 
-                    let runtime = Arc::clone(&runtime);
+            debug_log!("New connection from {:?}", addr);
+            let runtime = Arc::clone(&runtime);
 
-                    thread::spawn(move || {
-                        if let Err(e) = pglited::handle_connection(stream, runtime) {
-                            debug_log!("Connection error from {:?}: {:?}", addr, e);
-                        } else {
-                            debug_log!("Client {:?} disconnected", addr);
-                        }
-                    });
+            thread::spawn(move || {
+                let _permit = permit;
+                if let Err(e) = pglited::handle_connection(stream, runtime) {
+                    debug_log!("Connection error from {:?}: {:?}", addr, e);
+                } else {
+                    debug_log!("Client {:?} disconnected", addr);
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => {
-                    debug_log!("Accept error: {:?}", e);
-                }
-            }
+            });
         }
 
         drop(runtime);
@@ -474,40 +541,46 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
 
     debug_log!("\n=== Step 5: Accepting Connections ===");
 
-    loop {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            debug_log!("[SHUTDOWN] Received shutdown signal, exiting accept loop");
-            break;
-        }
-
-        tokio::select! {
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        let accepted = tokio::select! {
             biased;
 
-            result = tokio_listener.accept() => {
-                match result {
-                Ok((stream, addr)) => {
-                    debug_log!("New connection from {:?}", addr);
+            result = tokio_listener.accept() => result,
 
-                    let executor = Arc::clone(&executor);
-
-                    tokio::spawn(async move {
-                        if let Err(e) = pglited::handle_connection_async(stream, executor).await {
-                            debug_log!("Connection error from {:?}: {:?}", addr, e);
-                        } else {
-                            debug_log!("Client {:?} disconnected", addr);
-                        }
-                    });
-                }
-                    Err(e) => {
-                        debug_log!("Accept error: {:?}", e);
-                    }
-                }
+            _ = SHUTDOWN_NOTIFY.notified() => {
+                debug_log!("[SHUTDOWN] Received shutdown signal, exiting accept loop");
+                break;
             }
+        };
 
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+        let (mut stream, addr) = match accepted {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                debug_log!("Accept error: {:?}", e);
                 continue;
             }
-        }
+        };
+
+        let Some(permit) = limiter.try_acquire() else {
+            debug_log!("Rejecting {:?}: connection limit reached", addr);
+            use tokio::io::AsyncWriteExt;
+            let _ = stream
+                .write_all(&pglited::too_many_clients_response())
+                .await;
+            continue;
+        };
+
+        debug_log!("New connection from {:?}", addr);
+        let executor = Arc::clone(&executor);
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = pglited::handle_connection_async(stream, executor).await {
+                debug_log!("Connection error from {:?}: {:?}", addr, e);
+            } else {
+                debug_log!("Client {:?} disconnected", addr);
+            }
+        });
     }
 
     drop(runtime);
@@ -521,11 +594,17 @@ mod tests {
 
     #[test]
     fn parse_extensions_trims_and_skips_empty() {
-        let extensions = parse_extensions(" pg_trgm , ,vector, ");
+        let extensions = parse_extensions(" pg_trgm , ,vector, ").unwrap();
 
         assert_eq!(
             extensions,
             vec!["pg_trgm".to_string(), "vector".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_extensions_rejects_unsafe_names() {
+        assert!(parse_extensions("pg_trgm,../../etc/passwd").is_err());
+        assert!(parse_extensions("pg_trgm,a\"; evil()").is_err());
     }
 }
